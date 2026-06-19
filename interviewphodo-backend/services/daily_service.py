@@ -1,6 +1,7 @@
 import time
 import httpx
 from config import settings
+from services.interview_timing import DAILY_ROOM_SEC
 
 DAILY_BASE = "https://api.daily.co/v1"
 DAILY_HEADERS = {
@@ -10,14 +11,18 @@ DAILY_HEADERS = {
 
 
 async def create_interview_room(session_id: str) -> dict:
-    """
-    Creates a private Daily.co room. Expires after 45 minutes.
-    Returns: {"url": str, "name": str, "token": str}
-    The token is used by the Pipecat AI bot to join the room.
-    The url is sent to the frontend so the student can join.
+    """Create a private Daily.co room + tokens for AI bot and student.
+
+    Returns:
+        url    -> URL the student opens (already includes their meeting token)
+        name   -> Daily room name
+        token  -> AI bot's owner token (used by Pipecat to join)
     """
     room_name = f"phodo-{session_id[:12]}"
-    expiry = int(time.time()) + (45 * 60)
+    # Hard ceiling for the Daily room (and AI bot + student tokens).
+    # Interview runs 25–30 min; room expires slightly after max so goodbye audio
+    # can finish without Daily cutting the call mid-sentence.
+    expiry = int(time.time()) + DAILY_ROOM_SEC
 
     async with httpx.AsyncClient() as client:
         room_res = await client.post(
@@ -37,25 +42,39 @@ async def create_interview_room(session_id: str) -> dict:
         room_res.raise_for_status()
         room = room_res.json()
 
-        token_res = await client.post(
+        # AI bot token — owner privileges (used by Pipecat)
+        bot_token_res = await client.post(
             f"{DAILY_BASE}/meeting-tokens",
             headers=DAILY_HEADERS,
-            json={
-                "properties": {
-                    "room_name": room_name,
-                    "is_owner": True,
-                    "user_name": "InterviewPhodo AI",
-                    "exp": expiry,
-                }
-            },
+            json={"properties": {
+                "room_name": room_name,
+                "is_owner": True,
+                "user_name": "InterviewPhodo AI",
+                "exp": expiry,
+            }},
         )
-        token_res.raise_for_status()
-        token = token_res.json()
+        bot_token_res.raise_for_status()
+        bot_token = bot_token_res.json()["token"]
+
+        # Student token — regular participant
+        student_token_res = await client.post(
+            f"{DAILY_BASE}/meeting-tokens",
+            headers=DAILY_HEADERS,
+            json={"properties": {
+                "room_name": room_name,
+                "is_owner": False,
+                "user_name": "Student",
+                "exp": expiry,
+            }},
+        )
+        student_token_res.raise_for_status()
+        student_token = student_token_res.json()["token"]
 
     return {
-        "url":  room["url"],
-        "name": room["name"],
-        "token": token["token"],
+        "url":         room["url"],                        # bare URL (for AI bot)
+        "student_url": f"{room['url']}?t={student_token}", # tokenized URL (for student)
+        "name":        room["name"],
+        "token":       bot_token,
     }
 
 

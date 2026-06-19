@@ -19,8 +19,12 @@ def main():
         print("Error: set SUPABASE_URL and SUPABASE_ANON_KEY in .env")
         sys.exit(1)
 
-    email = input("Email: ").strip()
-    password = getpass.getpass("Password: ")
+    if len(sys.argv) >= 3:
+        email = sys.argv[1].strip()
+        password = sys.argv[2]
+    else:
+        email = input("Email: ").strip()
+        password = getpass.getpass("Password: ")
 
     response = httpx.post(
         f"{settings.supabase_url}/auth/v1/token?grant_type=password",

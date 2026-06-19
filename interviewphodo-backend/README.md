@@ -12,18 +12,26 @@ Real-time AI mock interview API for Indian BTech students.
 
 ## Setup
 
-### 1. Create a virtual environment
+### 1. Create a virtual environment (Python 3.12 + Pipecat)
 
-**Use Python 3.11 or 3.12** (Pipecat does not support Python 3.14 yet).
+**Use Python 3.11 or 3.12** — Pipecat does not support Python 3.14.
 
 ```bash
 cd interviewphodo-backend
-python3.12 -m venv .venv   # or python3.11
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
+python3.12 -m venv .venv312
+source .venv312/bin/activate
 pip install -r requirements-pipecat.txt
 ```
 
-For API-only development without the live interview pipeline:
+**Important:** After `source .venv312/bin/activate`, macOS may still run system `uvicorn` (Python 3.14). Always start with:
+
+```bash
+.venv312/bin/uvicorn main:app --reload
+# or:
+./start.sh
+```
+
+For API-only development without the live interview pipeline (works on Python 3.14):
 
 ```bash
 pip install -r requirements.txt
@@ -62,7 +70,14 @@ This creates `users`, `sessions`, `reports`, `payment_orders` plus RLS policies 
 ### 4. Run the server
 
 ```bash
-uvicorn main:app --reload
+source .venv312/bin/activate
+.venv312/bin/uvicorn main:app --reload
+```
+
+If port 8000 is already in use, stop the old process first:
+
+```bash
+lsof -i :8000 -t | xargs kill
 ```
 
 Health check: http://localhost:8000/health

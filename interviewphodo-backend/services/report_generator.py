@@ -1,6 +1,7 @@
 import logging
 from services.interview_fsm import InterviewState
 from services.speech_analyser import analyse_full_transcript
+from services.turn_scorer import build_turn_breakdown
 from database.supabase_client import supabase_admin
 
 logger = logging.getLogger(__name__)
@@ -10,6 +11,7 @@ async def generate_report(state: InterviewState):
     """Generate and save performance report after interview ends."""
     duration = state.get_duration_seconds()
     speech   = analyse_full_transcript(state.transcript, duration)
+    turn_breakdown = build_turn_breakdown(state.transcript)
 
     phase_scores = {
         phase: round(sum(scores) / len(scores), 1)
@@ -38,13 +40,29 @@ async def generate_report(state: InterviewState):
         "posture_score":      posture_score,
         "eye_contact_score":  eye_contact_score,
         "ai_closing_summary": closing_summary,
+        "turn_breakdown":     turn_breakdown,
     }
 
     try:
         supabase_admin.table("reports").insert(report).execute()
-        logger.info(f"Report saved | session={state.session_id}")
+        logger.info(
+            f"Report saved | session={state.session_id} "
+            f"turns_scored={len(turn_breakdown)}"
+        )
     except Exception as e:
-        logger.error(f"Report save failed: {e}")
+        # turn_breakdown column may not exist yet — retry without it
+        if "turn_breakdown" in str(e):
+            report.pop("turn_breakdown", None)
+            try:
+                supabase_admin.table("reports").insert(report).execute()
+                logger.warning(
+                    f"Report saved without turn_breakdown (run migration 002). "
+                    f"session={state.session_id}"
+                )
+            except Exception as e2:
+                logger.error(f"Report save failed: {e2}")
+        else:
+            logger.error(f"Report save failed: {e}")
 
 
 def _posture_score(events: list) -> int:

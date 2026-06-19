@@ -22,3 +22,14 @@ class _SupabaseProxy:
 
 
 supabase_admin = _SupabaseProxy()
+
+
+def fetch_one(query):
+    """Run a postgrest query and return the first row or None.
+
+    Replaces ``.single().execute()`` which throws on 0 rows. Use when the
+    row may legitimately not exist and you want to handle 'not found' yourself.
+    """
+    result = query.limit(1).execute()
+    rows = result.data or []
+    return rows[0] if rows else None

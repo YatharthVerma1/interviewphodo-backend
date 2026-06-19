@@ -1,12 +1,17 @@
 import uuid
 import io
+import os
+from pathlib import Path
+
 import boto3
 from botocore.client import Config
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from database.supabase_client import supabase_admin
 from models.user import UserProfile, UserUpdateRequest
 from config import settings
+
+LOCAL_UPLOAD_ROOT = Path(__file__).resolve().parent.parent / "uploads" / "resumes"
 
 router = APIRouter()
 security = HTTPBearer()
@@ -68,16 +73,20 @@ async def update_profile(
 
 @router.post("/upload-resume")
 async def upload_resume(
+     request: Request,
     file: UploadFile = File(...),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Student uploads resume PDF.
-    Saves file to Cloudflare R2.
-    Extracts text for injection into FSM interview prompts.
-    Saves resume_url and resume_text to users table.
+
+    - If Cloudflare R2 is configured -> uploads to R2.
+    - Otherwise -> saves to local ``uploads/resumes/`` folder (dev fallback).
+
+    In both cases the PDF text is extracted and saved on the user row so the
+    interviewer prompt can reference the candidate's projects.
     """
-    if not file.filename or not file.filename.endswith(".pdf"):
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Only PDF files accepted")
 
     content = await file.read()
@@ -85,35 +94,39 @@ async def upload_resume(
     if len(content) > 5 * 1024 * 1024:
         raise HTTPException(400, "File too large — max 5MB")
 
-    if not settings.r2_configured:
-        raise HTTPException(
-            status_code=503,
-            detail="Resume upload is not configured yet. Set R2_* environment variables.",
+    file_key = f"{current_user['id']}/{uuid.uuid4().hex}.pdf"
+
+    if settings.r2_configured:
+        r2 = boto3.client(
+            "s3",
+            endpoint_url=settings.r2_endpoint,
+            aws_access_key_id=settings.r2_access_key_id,
+            aws_secret_access_key=settings.r2_secret_access_key,
+            config=Config(signature_version="s3v4"),
+            region_name="auto",
         )
+        try:
+            r2.put_object(
+                Bucket=settings.r2_bucket_name,
+                Key=f"resumes/{file_key}",
+                Body=content,
+                ContentType="application/pdf",
+            )
+            resume_url = f"{settings.r2_endpoint}/{settings.r2_bucket_name}/resumes/{file_key}"
+            storage = "r2"
+        except Exception as e:
+            raise HTTPException(500, f"R2 upload failed: {str(e)}")
+    else:
+        local_path = LOCAL_UPLOAD_ROOT / file_key
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            local_path.write_bytes(content)
+        except OSError as e:
+            raise HTTPException(500, f"Local save failed: {e}")
+        base = str(request.base_url).rstrip("/")
+        resume_url = f"{base}/uploads/resumes/{file_key}"
+        storage = "local"
 
-    # Upload to Cloudflare R2
-    file_key = f"resumes/{current_user['id']}/{uuid.uuid4().hex}.pdf"
-    r2 = boto3.client(
-        "s3",
-        endpoint_url=settings.r2_endpoint,
-        aws_access_key_id=settings.r2_access_key_id,
-        aws_secret_access_key=settings.r2_secret_access_key,
-        config=Config(signature_version="s3v4"),
-        region_name="auto",
-    )
-
-    try:
-        r2.put_object(
-            Bucket=settings.r2_bucket_name,
-            Key=file_key,
-            Body=content,
-            ContentType="application/pdf",
-        )
-        resume_url = f"{settings.r2_endpoint}/{settings.r2_bucket_name}/{file_key}"
-    except Exception as e:
-        raise HTTPException(500, f"Upload failed: {str(e)}")
-
-    # Extract text from PDF for prompt injection
     resume_text = _extract_pdf_text(content)
 
     supabase_admin.table("users").update({
@@ -123,6 +136,7 @@ async def upload_resume(
 
     return {
         "status": "uploaded",
+        "storage": storage,
         "resume_url": resume_url,
         "text_length": len(resume_text),
         "preview": resume_text[:150] + "..." if len(resume_text) > 150 else resume_text,

@@ -19,7 +19,7 @@ Message types received by frontend:
 
 import logging
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query, HTTPException
-from database.supabase_client import supabase_admin
+from database.supabase_client import fetch_one, supabase_admin
 from services.avatar_broadcaster import register_connection, unregister_connection
 
 router  = APIRouter()
@@ -48,22 +48,20 @@ async def avatar_websocket(
 
     # 2. Verify session belongs to this user
     try:
-        session = supabase_admin.table("sessions").select(
-            "user_id, status"
-        ).eq("id", session_id).single().execute()
-
-        if not session.data:
+        session = fetch_one(
+            supabase_admin.table("sessions")
+            .select("user_id, status")
+            .eq("id", session_id)
+        )
+        if not session:
             await websocket.close(code=4004, reason="Session not found")
             return
-
-        if session.data["user_id"] != user_id:
+        if session["user_id"] != user_id:
             await websocket.close(code=4003, reason="Forbidden")
             return
-
-        if session.data["status"] == "completed":
+        if session["status"] == "completed":
             await websocket.close(code=4000, reason="Session already completed")
             return
-
     except Exception as e:
         logger.error(f"Session validation error: {e}")
         await websocket.close(code=4500, reason="Server error")

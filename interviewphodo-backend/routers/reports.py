@@ -1,9 +1,29 @@
-from fastapi import APIRouter, Depends, HTTPException
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from routers.auth import get_current_user
 from models.report import ReportResponse
-from database.supabase_client import supabase_admin
+from database.supabase_client import fetch_one, supabase_admin
+from services.progress_tracker import build_user_progress
+from services.turn_scorer import build_turn_breakdown
 
 router = APIRouter()
+
+
+def _enrich_report_with_turns(report: dict, session_id: str) -> dict:
+    """If turn_breakdown is missing from the report row, build it from session transcript."""
+    if report.get("turn_breakdown"):
+        return report
+    session = fetch_one(
+        supabase_admin.table("sessions")
+        .select("transcript")
+        .eq("id", session_id)
+    )
+    if session and session.get("transcript"):
+        report["turn_breakdown"] = build_turn_breakdown(session["transcript"])
+    else:
+        report["turn_breakdown"] = []
+    return report
 
 
 @router.get("/session/{session_id}", response_model=ReportResponse)
@@ -11,21 +31,76 @@ async def get_report(
     session_id: str,
     current_user: dict = Depends(get_current_user),
 ):
-    session = supabase_admin.table("sessions").select("user_id").eq(
-        "id", session_id
-    ).single().execute()
-
-    if not session.data or session.data["user_id"] != current_user["id"]:
+    session = fetch_one(
+        supabase_admin.table("sessions").select("user_id").eq("id", session_id)
+    )
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session["user_id"] != current_user["id"]:
         raise HTTPException(403, "Not authorized")
 
-    report = supabase_admin.table("reports").select("*").eq(
-        "session_id", session_id
-    ).single().execute()
-
-    if not report.data:
+    report = fetch_one(
+        supabase_admin.table("reports").select("*").eq("session_id", session_id)
+    )
+    if not report:
         raise HTTPException(404, "Report not ready yet — session may still be completing")
 
-    return report.data
+    return _enrich_report_with_turns(report, session_id)
+
+
+@router.get("/session/{session_id}/turns")
+async def get_session_turns(
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Per-turn feedback for one session — usable even before report row exists."""
+    session = fetch_one(
+        supabase_admin.table("sessions")
+        .select("user_id, status, transcript, company, round_type")
+        .eq("id", session_id)
+    )
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session["user_id"] != current_user["id"]:
+        raise HTTPException(403, "Not authorized")
+
+    breakdown = build_turn_breakdown(session.get("transcript") or [])
+    return {
+        "session_id":     session_id,
+        "company":        session.get("company"),
+        "round_type":     session.get("round_type"),
+        "status":         session.get("status"),
+        "turn_breakdown": breakdown,
+        "total_scored":   len(breakdown),
+    }
+
+
+@router.get("/my-progress")
+async def my_progress(
+    company: Optional[str] = Query(
+        None,
+        description="Filter progress to one company (e.g. tcs). Omit for all companies.",
+    ),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Progress data for charts — score timeline, filler trend, WPM trend,
+    per-phase averages, and skill heatmap buckets.
+
+    Frontend can plot:
+      - score_timeline  → line chart of overall score over sessions
+      - filler_timeline → line chart (lower is better)
+      - wpm_timeline    → line chart (ideal ~130-150)
+      - by_skill        → bar chart / radar chart
+      - by_company      → comparison cards
+    """
+    if company and company.lower() not in {
+        "tcs", "infosys", "wipro", "hcl", "accenture",
+        "cognizant", "tech_mahindra", "zoho",
+    }:
+        raise HTTPException(400, "Invalid company filter")
+
+    return build_user_progress(current_user["id"], company=company)
 
 
 @router.get("/my-reports")

@@ -1,8 +1,14 @@
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from config import settings
 from routers import auth, avatar_ws, payments, reports, sessions
+
+UPLOAD_DIR = Path(__file__).resolve().parent / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(
     title="interviewphodo.com API",
@@ -23,6 +29,17 @@ app.include_router(sessions.router, prefix="/api/sessions", tags=["sessions"])
 app.include_router(reports.router, prefix="/api/reports", tags=["reports"])
 app.include_router(payments.router, prefix="/api/payments", tags=["payments"])
 app.include_router(avatar_ws.router, prefix="/ws", tags=["avatar"])
+
+app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
+
+
+@app.get("/")
+async def root():
+    return {
+        "message": "interviewphodo.com API is running",
+        "docs": "/docs",
+        "health": "/health",
+    }
 
 
 @app.get("/health")

@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from config import settings
-from database.supabase_client import supabase_admin
+from database.supabase_client import fetch_one, supabase_admin
 from routers.auth import get_current_user
 
 router = APIRouter()
@@ -25,7 +25,11 @@ def _get_razorpay_client():
     if not settings.razorpay_configured:
         raise HTTPException(
             status_code=503,
-            detail="Payments are not configured yet. Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET in .env",
+            detail=(
+                "Payments are not enabled in this environment. "
+                "Razorpay integration is deferred — for now, top up sessions "
+                "directly in Supabase by updating the users.sessions_limit column."
+            ),
         )
     import razorpay
     return razorpay.Client(auth=(settings.razorpay_key_id, settings.razorpay_key_secret))
@@ -94,23 +98,27 @@ async def verify_payment(
     if expected != signature:
         raise HTTPException(400, "Invalid payment signature")
 
-    order_row = supabase_admin.table("payment_orders").select("*").eq(
-        "razorpay_order_id", order_id
-    ).single().execute()
-
-    if not order_row.data:
+    order_row = fetch_one(
+        supabase_admin.table("payment_orders")
+        .select("*")
+        .eq("razorpay_order_id", order_id)
+    )
+    if not order_row:
         raise HTTPException(404, "Order not found")
 
-    if order_row.data["status"] == "paid":
+    if order_row["status"] == "paid":
         return {"status": "already_processed"}
 
-    sessions_to_add = order_row.data["sessions_granted"]
+    sessions_to_add = order_row["sessions_granted"]
 
-    user = supabase_admin.table("users").select(
-        "sessions_limit"
-    ).eq("id", current_user["id"]).single().execute()
-
-    new_limit = user.data["sessions_limit"] + sessions_to_add
+    user = fetch_one(
+        supabase_admin.table("users")
+        .select("sessions_limit")
+        .eq("id", current_user["id"])
+    )
+    if not user:
+        raise HTTPException(404, "User profile not found")
+    new_limit = user["sessions_limit"] + sessions_to_add
 
     supabase_admin.table("users").update({
         "sessions_limit": new_limit

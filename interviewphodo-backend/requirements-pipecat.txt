@@ -1,3 +1,6 @@
-# Full stack including Pipecat (Python 3.11 or 3.12 recommended)
+# Full stack including Pipecat (Python 3.11 or 3.12 required)
 -r requirements.txt
-pipecat-ai[daily,google]==0.0.47
+pipecat-ai[daily,google,silero]==0.0.108
+# Pin httpx to keep supabase-py 2.5.0 happy
+httpx>=0.27,<0.28
+onnxruntime>=1.17.0
