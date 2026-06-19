@@ -2,15 +2,19 @@ import uuid
 import io
 import boto3
 from botocore.client import Config
-from fastapi import APIRouter, Depends, HTTPException, Header, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from database.supabase_client import supabase_admin
 from models.user import UserProfile, UserUpdateRequest
 from config import settings
 
 router = APIRouter()
+security = HTTPBearer()
 
 
-async def get_current_user(authorization: str = Header(...)) -> dict:
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> dict:
     """
     Validates Supabase JWT sent as: Authorization: Bearer <token>
     Returns the user's row from public.users table.
@@ -22,10 +26,7 @@ async def get_current_user(authorization: str = Header(...)) -> dict:
             detail="Supabase is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_KEY in .env",
         )
 
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid authorization header format")
-
-    token = authorization.replace("Bearer ", "").strip()
+    token = credentials.credentials.strip()
 
     try:
         auth_response = supabase_admin.auth.get_user(token)
