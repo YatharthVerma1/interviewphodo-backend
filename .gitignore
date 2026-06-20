@@ -1,4 +1,10 @@
 .venv/
+.venv312/
 .env
 __pycache__/
 *.pyc
+.pytest_cache/
+*.egg-info/
+uploads/
+.DS_Store
+.cursor/
