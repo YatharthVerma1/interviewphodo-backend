@@ -139,13 +139,34 @@ async def _end_interview(state: InterviewState, reason: str = "completed"):
             **state.to_db_dict(),
             "status": "completed" if reason == "completed" else "abandoned",
             "ended_at": "now()",
-            "duration_seconds": state.get_duration_seconds(),
+            "duration_seconds": state.get_interview_elapsed_seconds(),
         }).eq("id", state.session_id).execute()
 
         if reason == "completed" and state.total_turns >= 4:
             await generate_report(state)
+        elif reason == "student_left" and state.total_turns >= 3:
+            # Partial report when the student leaves after a real conversation.
+            await generate_report(state)
     except Exception as e:
         logger.error(f"End interview error: {e}")
+
+
+def _is_student_participant(participant: dict, student_participant_id: str | None = None) -> bool:
+    """Return True when the leaving/joining participant is the student, not our bot."""
+    if participant.get("local"):
+        return False
+    pid = participant.get("id")
+    if student_participant_id and pid == student_participant_id:
+        return True
+    user_name = (
+        participant.get("user_name")
+        or (participant.get("info") or {}).get("userName")
+        or ""
+    )
+    if user_name == "InterviewPhodo AI":
+        return False
+    # Daily student token uses user_name "Student"; any remote participant counts.
+    return bool(pid)
 
 
 def _phase_to_expression(phase: str) -> str:
@@ -175,6 +196,7 @@ async def run_interview_pipeline(
         from pipecat.audio.vad.silero import SileroVADAnalyzer
         from pipecat.audio.vad.vad_analyzer import VADParams
         from pipecat.frames.frames import (
+            CancelFrame,
             EndFrame,
             LLMFullResponseEndFrame,
             LLMRunFrame,
@@ -452,6 +474,28 @@ async def run_interview_pipeline(
     # NO_SHOW_TIMEOUT_SEC, the session ends without charging a credit.
     NO_SHOW_TIMEOUT_SEC = 5 * 60
     participant_joined = asyncio.Event()
+    student_participant_id: str | None = None
+    ending = False
+    watchdog_task = None
+    time_watchdog_task = None
+
+    async def _shutdown_session(reason: str):
+        """Pause timers, persist state, and tear down the pipeline once."""
+        nonlocal ending
+        if ending:
+            return
+        ending = True
+
+        for bg_task in (watchdog_task, time_watchdog_task):
+            if bg_task and not bg_task.done():
+                bg_task.cancel()
+
+        logger.info(f"Shutting down interview | session={session_id} reason={reason}")
+        await broadcast(session_id, {"type": "session_paused", "reason": reason})
+        await broadcast(session_id, {"type": "session_ended", "reason": reason})
+        await _end_interview(state, reason=reason)
+        # Cancel any in-flight Gemini audio, then end the pipeline.
+        await task.queue_frames([CancelFrame(), EndFrame()])
 
     @transport.event_handler("on_first_participant_joined")
     async def on_first_join(transport, participant):
@@ -460,9 +504,11 @@ async def run_interview_pipeline(
         2. Deduct one session credit (the user actually showed up).
         3. Fire LLMRunFrame so Gemini speaks the seeded greeting.
         """
+        nonlocal student_participant_id
+        student_participant_id = participant.get("id")
         participant_joined.set()
         state.joined_at = time.time()
-        logger.info(f"Student joined: {participant.get('id', 'unknown')} — triggering greeting")
+        logger.info(f"Student joined: {student_participant_id} — triggering greeting")
         try:
             current = supabase_admin.table("users").select(
                 "sessions_used"
@@ -478,10 +524,17 @@ async def run_interview_pipeline(
 
     @transport.event_handler("on_participant_left")
     async def on_left(transport, participant, reason):
-        logger.info(f"Student left: {participant.get('id', 'unknown')}")
-        await broadcast(session_id, {"type": "session_ended", "reason": "student_left"})
-        await _end_interview(state, reason="student_left")
-        await task.queue_frame(EndFrame())
+        if not _is_student_participant(participant, student_participant_id):
+            logger.debug(
+                f"Ignoring participant left (not student): {participant.get('id', 'unknown')}"
+            )
+            return
+        if not participant_joined.is_set():
+            return
+        logger.info(
+            f"Student left room (reason={reason}) — pausing and ending interview"
+        )
+        await _shutdown_session("student_left")
 
     async def no_show_watchdog():
         """End the session if no student joins within NO_SHOW_TIMEOUT_SEC.
@@ -577,8 +630,7 @@ async def run_interview_pipeline(
             )
             await sleep_until(MAX_INTERVIEW_SEC)
             logger.info("Time watchdog: ending pipeline at hard cap")
-            await _end_interview(state, reason="time_capped")
-            await task.queue_frame(EndFrame())
+            await _shutdown_session("time_capped")
         except asyncio.CancelledError:
             return
         except Exception as e:
@@ -597,9 +649,9 @@ async def run_interview_pipeline(
         logger.error(f"Pipeline error: {e}")
         await _end_interview(state, reason="error")
     finally:
-        if not watchdog_task.done():
+        if watchdog_task and not watchdog_task.done():
             watchdog_task.cancel()
-        if not time_watchdog_task.done():
+        if time_watchdog_task and not time_watchdog_task.done():
             time_watchdog_task.cancel()
         remove_session_state(session_id)
         remove_session_connections(session_id)
