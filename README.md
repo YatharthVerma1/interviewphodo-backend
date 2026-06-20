@@ -17,6 +17,7 @@ Real-time AI mock interview API for Indian BTech students.
 **Use Python 3.11 or 3.12** — Pipecat does not support Python 3.14.
 
 ```bash
+cd interviewphodo-backend
 python3.12 -m venv .venv312
 source .venv312/bin/activate
 pip install -r requirements-pipecat.txt
@@ -115,6 +116,7 @@ curl -X POST http://localhost:8000/api/sessions/start \
 ## Project layout
 
 ```
+interviewphodo-backend/
 ├── main.py                 # FastAPI app entry point
 ├── config.py               # Environment settings
 ├── routers/                # HTTP + WebSocket routes
