@@ -27,7 +27,10 @@ ROUND TYPES — mapped to actual Indian placement rounds the user picks:
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import Optional
+import logging
 import time
+
+logger = logging.getLogger(__name__)
 
 
 class InterviewPhase(Enum):
@@ -40,73 +43,71 @@ class InterviewPhase(Enum):
     CLOSING      = "closing"
 
 
+# Hero phase per round — used when extending interviews that finish too quickly.
+HERO_PHASE_BY_ROUND: dict[str, InterviewPhase] = {
+    "technical":     InterviewPhase.TECHNICAL,
+    "managerial":    InterviewPhase.BEHAVIORAL,
+    "hr":            InterviewPhase.HR_ROUND,
+    "full":          InterviewPhase.TECHNICAL,
+    "coaching":      InterviewPhase.BEHAVIORAL,
+    "multi_persona": InterviewPhase.TECHNICAL,
+    "mixed":         InterviewPhase.TECHNICAL,
+}
+
 # Per-round phase plan: (phase, turns_in_phase).
-# Each round has its own emphasis — heavy rounds (technical/HR/managerial) get
-# more turns in their hero phase and fewer everywhere else, so the interview
-# *feels* like that real round, not the same flow with a different label.
-#
-# Total turn count is roughly tuned to fit 25–28 minutes of speaking time
-# (the time watchdog enforces the 25–30 min wall-clock window independently).
+# Turn budgets target ~35–50 min of content at ~35–45 sec/turn so the FSM
+# does not exhaust before the 25-min wall-clock minimum. The time watchdog
+# still enforces the hard 30-min cap.
 ROUND_PHASE_PLAN: dict[str, list[tuple["InterviewPhase", int]]] = {
-    # Round 2-3: Technical — DSA + Core CS + Project deep-dive
     "technical": [
-        (InterviewPhase.INTRO,        2),
-        (InterviewPhase.RESUME,       3),
-        (InterviewPhase.TECHNICAL,    9),  # hero phase
-        (InterviewPhase.BEHAVIORAL,   4),
-        (InterviewPhase.CANDIDATE_QA, 2),
-        (InterviewPhase.CLOSING,      3),
-    ],
-    # Round 5: Managerial — situational, project ownership, leadership, fitment
-    "managerial": [
-        (InterviewPhase.INTRO,        2),
+        (InterviewPhase.INTRO,        3),
         (InterviewPhase.RESUME,       5),
-        (InterviewPhase.BEHAVIORAL,   9),  # hero phase
-        (InterviewPhase.CANDIDATE_QA, 3),
-        (InterviewPhase.CLOSING,      3),
+        (InterviewPhase.TECHNICAL,   14),
+        (InterviewPhase.BEHAVIORAL,   6),
+        (InterviewPhase.CANDIDATE_QA, 4),
+        (InterviewPhase.CLOSING,      4),
     ],
-    # Round 6: HR — salary, career, India trap questions
+    "managerial": [
+        (InterviewPhase.INTRO,        3),
+        (InterviewPhase.RESUME,       6),
+        (InterviewPhase.BEHAVIORAL,  14),
+        (InterviewPhase.CANDIDATE_QA, 5),
+        (InterviewPhase.CLOSING,      4),
+    ],
     "hr": [
-        (InterviewPhase.INTRO,        2),
-        (InterviewPhase.RESUME,       3),
-        (InterviewPhase.HR_ROUND,     9),  # hero phase
-        (InterviewPhase.BEHAVIORAL,   4),
-        (InterviewPhase.CANDIDATE_QA, 2),
-        (InterviewPhase.CLOSING,      3),
+        (InterviewPhase.INTRO,        3),
+        (InterviewPhase.RESUME,       5),
+        (InterviewPhase.HR_ROUND,    14),
+        (InterviewPhase.BEHAVIORAL,   6),
+        (InterviewPhase.CANDIDATE_QA, 4),
+        (InterviewPhase.CLOSING,      4),
     ],
-    # Full all-in-one practice (longest)
     "full": [
-        (InterviewPhase.INTRO,        2),
-        (InterviewPhase.RESUME,       4),
-        (InterviewPhase.TECHNICAL,    6),
-        (InterviewPhase.BEHAVIORAL,   5),
-        (InterviewPhase.HR_ROUND,     5),
-        (InterviewPhase.CANDIDATE_QA, 3),
-        (InterviewPhase.CLOSING,      3),
+        (InterviewPhase.INTRO,        3),
+        (InterviewPhase.RESUME,       6),
+        (InterviewPhase.TECHNICAL,   10),
+        (InterviewPhase.BEHAVIORAL,   8),
+        (InterviewPhase.HR_ROUND,     8),
+        (InterviewPhase.CANDIDATE_QA, 5),
+        (InterviewPhase.CLOSING,      4),
     ],
-    # Coaching mode — same surface flow, but the AI TEACHES rather than tests.
-    # Fewer turns per phase because each turn is much longer (model answer +
-    # framework + retry), but still enough wall-clock time for 25+ minutes.
     "coaching": [
-        (InterviewPhase.INTRO,        2),
-        (InterviewPhase.RESUME,       3),
-        (InterviewPhase.TECHNICAL,    4),
-        (InterviewPhase.BEHAVIORAL,   4),
-        (InterviewPhase.HR_ROUND,     4),
-        (InterviewPhase.CANDIDATE_QA, 2),
-        (InterviewPhase.CLOSING,      3),
+        (InterviewPhase.INTRO,        3),
+        (InterviewPhase.RESUME,       5),
+        (InterviewPhase.TECHNICAL,    6),
+        (InterviewPhase.BEHAVIORAL,   6),
+        (InterviewPhase.HR_ROUND,     6),
+        (InterviewPhase.CANDIDATE_QA, 4),
+        (InterviewPhase.CLOSING,      4),
     ],
-    # Multi-persona panel — different interviewer per phase, simulating real
-    # Indian placement panels (separate HR + tech + manager rooms). Personas
-    # change at phase boundaries with an explicit on-call handoff.
     "multi_persona": [
-        (InterviewPhase.INTRO,        2),
-        (InterviewPhase.RESUME,       4),
-        (InterviewPhase.TECHNICAL,    5),
-        (InterviewPhase.BEHAVIORAL,   4),
-        (InterviewPhase.HR_ROUND,     5),
-        (InterviewPhase.CANDIDATE_QA, 2),
-        (InterviewPhase.CLOSING,      3),
+        (InterviewPhase.INTRO,        3),
+        (InterviewPhase.RESUME,       6),
+        (InterviewPhase.TECHNICAL,    8),
+        (InterviewPhase.BEHAVIORAL,   7),
+        (InterviewPhase.HR_ROUND,     7),
+        (InterviewPhase.CANDIDATE_QA, 4),
+        (InterviewPhase.CLOSING,      4),
     ],
 }
 
@@ -196,11 +197,22 @@ class InterviewState:
     def should_advance(self) -> bool:
         return self.phase_turn >= self.get_phase_budget()
 
-    def is_complete(self) -> bool:
+    def is_fsm_finished(self) -> bool:
+        """True when all planned phases/turns are exhausted (ignores wall clock)."""
         return (
             self.current_phase == InterviewPhase.CLOSING
             and self.phase_turn >= self.get_phase_budget(InterviewPhase.CLOSING)
         )
+
+    def is_complete(self) -> bool:
+        """Interview may end naturally only after FSM is done AND 25+ min elapsed."""
+        from services.interview_timing import MIN_INTERVIEW_SEC
+        if not self.is_fsm_finished():
+            return False
+        return self.get_interview_elapsed_seconds() >= MIN_INTERVIEW_SEC
+
+    def hero_phase(self) -> InterviewPhase:
+        return HERO_PHASE_BY_ROUND.get(self.round_type, InterviewPhase.BEHAVIORAL)
 
     def get_interview_elapsed_seconds(self) -> int:
         """Wall-clock seconds since the student joined (falls back to session age)."""
@@ -208,14 +220,32 @@ class InterviewState:
             return int(time.time() - self.joined_at)
         return self.get_duration_seconds()
 
-    def extend_if_under_minimum(self, min_sec: int, extra_turns: int = 2) -> bool:
-        """If the FSM is done but we're still under the minimum interview length,
-        add more CLOSING turns so the AI keeps the conversation going."""
-        if not self.is_complete():
-            return False
+    def extend_if_under_minimum(self, min_sec: int, extra_turns: int = 6) -> bool:
+        """Keep the interview going until the 25-min wall-clock minimum is met.
+
+        When the FSM runs out of turns too quickly (common with fast answers),
+        jump back to the round's hero phase for deeper follow-up questions
+        instead of ending after only a few minutes.
+        """
         if self.get_interview_elapsed_seconds() >= min_sec:
             return False
-        self.phase_budgets[InterviewPhase.CLOSING] = self.phase_turn + extra_turns
+
+        hero = self.hero_phase()
+
+        if self.is_fsm_finished() or self.current_phase == InterviewPhase.CLOSING:
+            # Rewind to hero phase — e.g. more HR traps, more technical depth.
+            self.current_phase = hero
+            self.phase_turn = 0
+            self.phase_budgets[hero] = self.phase_budgets.get(hero, 6) + extra_turns
+            logger_msg = f"extended hero phase {hero.value} +{extra_turns} turns"
+        else:
+            self.phase_budgets[self.current_phase] = self.phase_turn + extra_turns
+            logger_msg = f"extended {self.current_phase.value} +{extra_turns} turns"
+
+        logger.info(
+            f"Interview extension | session={self.session_id} "
+            f"elapsed={self.get_interview_elapsed_seconds()}s | {logger_msg}"
+        )
         return True
 
     def record_turn(
@@ -272,12 +302,15 @@ class InterviewState:
 
         Returns True if budgets were rebalanced this turn, False otherwise.
         """
-        from services.interview_timing import REBALANCE_TARGET_SEC
+        from services.interview_timing import MIN_INTERVIEW_SEC, REBALANCE_TARGET_SEC
 
         if target_total_sec is None:
             target_total_sec = REBALANCE_TARGET_SEC
 
         elapsed = self.get_interview_elapsed_seconds()
+        # Never shrink phases while we are still under the 25-min minimum.
+        if elapsed < MIN_INTERVIEW_SEC:
+            return False
         if self.total_turns < 4 or elapsed <= 0:
             return False  # need a few real turns of data first
 

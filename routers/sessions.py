@@ -2,12 +2,13 @@ import asyncio
 import logging
 import uuid
 from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from routers.auth import get_current_user
 from models.session import SessionStartRequest, SessionResponse, PostureEventRequest
 from services.daily_service import create_interview_room
+from services.interview_pipeline import request_pipeline_shutdown, run_interview_pipeline
 from services.interview_fsm import get_session_state
-from services.interview_pipeline import run_interview_pipeline
 from prompts.companies import VALID_COMPANIES
 from database.supabase_client import fetch_one, supabase_admin
 from config import settings
@@ -195,6 +196,8 @@ async def end_session(
         raise HTTPException(404, "Session not found")
     if row["user_id"] != current_user["id"]:
         raise HTTPException(403, "Not authorized")
+
+    await request_pipeline_shutdown(session_id, reason="manual_end")
 
     supabase_admin.table("sessions").update({
         "status": "abandoned", "ended_at": "now()"

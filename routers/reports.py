@@ -5,23 +5,23 @@ from routers.auth import get_current_user
 from models.report import ReportResponse
 from database.supabase_client import fetch_one, supabase_admin
 from services.progress_tracker import build_user_progress
+from services.report_enricher import enrich_report_from_session
 from services.turn_scorer import build_turn_breakdown
 
 router = APIRouter()
 
 
 def _enrich_report_with_turns(report: dict, session_id: str) -> dict:
-    """If turn_breakdown is missing from the report row, build it from session transcript."""
-    if report.get("turn_breakdown"):
-        return report
+    """Enrich report with turn breakdown and recomputed speech metrics."""
     session = fetch_one(
         supabase_admin.table("sessions")
-        .select("transcript")
+        .select("transcript, duration_seconds, status, company, round_type")
         .eq("id", session_id)
     )
-    if session and session.get("transcript"):
+    report = enrich_report_from_session(report, session)
+    if not report.get("turn_breakdown") and session and session.get("transcript"):
         report["turn_breakdown"] = build_turn_breakdown(session["transcript"])
-    else:
+    elif not report.get("turn_breakdown"):
         report["turn_breakdown"] = []
     return report
 
@@ -110,8 +110,21 @@ async def my_reports(
 ):
     rows = supabase_admin.table("reports").select(
         "id, session_id, overall_score, phase_scores, filler_count, "
-        "words_per_minute, pace_verdict, posture_score, created_at"
+        "words_per_minute, pace_verdict, posture_score, created_at, turn_breakdown"
     ).eq("user_id", current_user["id"]).order(
         "created_at", desc=True
     ).limit(limit).execute()
-    return rows.data
+
+    session_ids = [r["session_id"] for r in (rows.data or [])]
+    sessions_by_id = {}
+    if session_ids:
+        sess_rows =         supabase_admin.table("sessions").select(
+            "id, transcript, duration_seconds, filler_count, status, company, round_type"
+        ).in_("id", session_ids).execute()
+        sessions_by_id = {s["id"]: s for s in (sess_rows.data or [])}
+
+    enriched = [
+        enrich_report_from_session(r, sessions_by_id.get(r["session_id"]))
+        for r in (rows.data or [])
+    ]
+    return enriched

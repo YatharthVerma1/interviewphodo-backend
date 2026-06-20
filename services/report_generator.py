@@ -1,6 +1,6 @@
 import logging
 from services.interview_fsm import InterviewState
-from services.speech_analyser import analyse_full_transcript
+from services.speech_analyser import analyse_full_transcript, total_filler_count_for_state
 from services.turn_scorer import build_turn_breakdown
 from database.supabase_client import supabase_admin
 
@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 async def generate_report(state: InterviewState):
     """Generate and save performance report after interview ends."""
-    duration = state.get_duration_seconds()
+    duration = state.get_interview_elapsed_seconds() or state.get_duration_seconds()
     speech   = analyse_full_transcript(state.transcript, duration)
     turn_breakdown = build_turn_breakdown(state.transcript)
 
@@ -19,11 +19,7 @@ async def generate_report(state: InterviewState):
         if scores
     }
 
-    # Get AI closing summary from last CLOSING phase turn
-    closing_summary = next(
-        (t["ai_text"] for t in reversed(state.transcript) if t.get("phase") == "closing"),
-        ""
-    )
+    closing_summary = _extract_closing_summary(state.transcript)
 
     posture_score     = _posture_score(state.posture_events)
     eye_contact_score = _eye_contact_score(state.posture_events)
@@ -33,7 +29,7 @@ async def generate_report(state: InterviewState):
         "user_id":            state.user_id,
         "overall_score":      state.get_overall_score(),
         "phase_scores":       phase_scores,
-        "filler_count":       speech.get("filler_count", 0),
+        "filler_count":       total_filler_count_for_state(state),
         "filler_percentage":  speech.get("filler_pct", 0.0),
         "words_per_minute":   speech.get("words_per_min", 0.0),
         "pace_verdict":       speech.get("pace_verdict", ""),
@@ -63,6 +59,32 @@ async def generate_report(state: InterviewState):
                 logger.error(f"Report save failed: {e2}")
         else:
             logger.error(f"Report save failed: {e}")
+
+
+def _extract_closing_summary(transcript: list) -> str:
+    """Pick the substantive closing report, not the short goodbye line."""
+    closing_texts = [
+        (t.get("ai_text") or "").strip()
+        for t in transcript
+        if t.get("phase") == "closing" and (t.get("ai_text") or "").strip()
+    ]
+    if not closing_texts:
+        return ""
+
+    # Longest closing turn is usually the structured performance report.
+    substantial = [t for t in closing_texts if len(t) >= 120]
+    if substantial:
+        return max(substantial, key=len)
+
+    # Skip one-line goodbyes if a longer closing turn exists.
+    non_goodbye = [
+        t for t in closing_texts
+        if "goodbye" not in t.lower() or len(t) > 50
+    ]
+    if non_goodbye:
+        return max(non_goodbye, key=len)
+
+    return closing_texts[-1]
 
 
 def _posture_score(events: list) -> int:

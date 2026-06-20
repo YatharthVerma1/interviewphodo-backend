@@ -27,6 +27,58 @@ from database.supabase_client import supabase_admin
 _active_pipeline_count = 0
 _daily_lock = asyncio.Lock()
 
+# Lets /api/sessions/{id}/end tear down the Pipecat task instead of leaving
+# the bot running until the 30-min cap.
+_shutdown_handlers: dict[str, callable] = {}
+
+
+def register_shutdown_handler(session_id: str, handler) -> None:
+    _shutdown_handlers[session_id] = handler
+
+
+def unregister_shutdown_handler(session_id: str) -> None:
+    _shutdown_handlers.pop(session_id, None)
+
+
+async def request_pipeline_shutdown(session_id: str, reason: str = "manual_end") -> bool:
+    handler = _shutdown_handlers.get(session_id)
+    if not handler:
+        return False
+    await handler(reason)
+    return True
+
+
+def _extract_latest_student_text(context) -> str:
+    """Read the student's last answer from LLM context.
+
+    Gemini Live pushes user TranscriptionFrames UPSTREAM, so our turn processor
+    never sees them on the downstream path. The user context aggregator stores
+    the full utterance here when the student stops speaking.
+    """
+    get_messages = getattr(context, "get_messages", None)
+    messages = get_messages() if get_messages else getattr(context, "messages", [])
+    skip_prefixes = (
+        "[INTERNAL",
+        "Please introduce yourself and start the interview now.",
+    )
+    for msg in reversed(messages):
+        role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", None)
+        if role != "user":
+            continue
+        content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", "")
+        if isinstance(content, list):
+            content = " ".join(
+                part.get("text", str(part)) if isinstance(part, dict) else str(part)
+                for part in content
+            )
+        text = (content or "").strip()
+        if not text:
+            continue
+        if any(text.startswith(prefix) for prefix in skip_prefixes):
+            continue
+        return text
+    return ""
+
 
 async def _register_pipeline_start():
     global _active_pipeline_count
@@ -69,7 +121,7 @@ from services.interview_timing import (
     REBALANCE_TARGET_SEC,
     WARN_5MIN_AT,
 )
-from services.speech_analyser import detect_filler_words
+from services.speech_analyser import detect_fillers_combined
 from services.turn_scorer import score_turn
 
 
@@ -199,9 +251,10 @@ async def run_interview_pipeline(
             CancelFrame,
             EndFrame,
             LLMFullResponseEndFrame,
+            LLMFullResponseStartFrame,
             LLMRunFrame,
-            TextFrame,
             TranscriptionFrame,
+            TTSTextFrame,
         )
         from pipecat.pipeline.pipeline import Pipeline
         from pipecat.pipeline.runner import PipelineRunner
@@ -209,6 +262,7 @@ async def run_interview_pipeline(
         from pipecat.processors.aggregators.llm_context import LLMContext
         from pipecat.processors.aggregators.llm_response_universal import (
             LLMContextAggregatorPair,
+            LLMUserAggregatorParams,
         )
         from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
         from pipecat.services.google.gemini_live.llm import (
@@ -234,22 +288,35 @@ async def run_interview_pipeline(
         ) from e
 
     class InterviewTurnProcessor(FrameProcessor):
-        def __init__(self, state, session_id, gemini, **kwargs):
+        def __init__(self, state, session_id, gemini, context, student_speech, bot_state, **kwargs):
             super().__init__(**kwargs)
             self.state = state
             self.session_id = session_id
             self.gemini = gemini
+            self.context = context
+            self.student_speech = student_speech
+            self.bot_state = bot_state
             self.task = None
             self._last_user_text = ""
             self._ai_text_parts: list[str] = []
 
         async def _on_turn_complete(self):
+            nonlocal last_activity_at
+            last_activity_at = time.time()
             ai_text = " ".join(self._ai_text_parts).strip()
             self._ai_text_parts = []
-            student_text = self._last_user_text.strip()
+            self.bot_state["responding"] = False
+
+            # Primary: captured when Pipecat user aggregator finishes a turn.
+            student_text = self.student_speech.get("pending", "").strip()
+            if not student_text:
+                student_text = _extract_latest_student_text(self.context)
+            if not student_text:
+                student_text = self._last_user_text.strip()
+            self.student_speech["pending"] = ""
             self._last_user_text = ""
 
-            fillers = detect_filler_words(student_text)
+            fillers = detect_fillers_combined(student_text, ai_text)
             turn_score, turn_feedback = score_turn(
                 phase=self.state.current_phase.value,
                 student_text=student_text,
@@ -337,30 +404,45 @@ async def run_interview_pipeline(
                 await _sync_state_to_db(self.state)
 
             if self.state.is_complete():
-                if self.state.extend_if_under_minimum(MIN_INTERVIEW_SEC):
-                    logger.info(
-                        f"Interview under {MIN_INTERVIEW_SEC // 60} min minimum — "
-                        f"extending CLOSING | session={self.session_id}"
-                    )
-                    await _speak_to_student(
-                        "[INTERNAL TIMING NOTE] We still have a few minutes left in "
-                        "this interview. Ask one or two thoughtful follow-up questions, "
-                        "or invite the candidate to ask you anything, before your "
-                        "final summary."
-                    )
-                    return
-
                 await broadcast(self.session_id, {"type": "interview_complete"})
                 await asyncio.sleep(4)
                 await _end_interview(self.state, reason="completed")
                 if self.task:
                     await self.task.queue_frame(EndFrame())
+            elif self.state.is_fsm_finished():
+                if self.state.extend_if_under_minimum(MIN_INTERVIEW_SEC):
+                    logger.info(
+                        f"Interview under {MIN_INTERVIEW_SEC // 60} min — extending | "
+                        f"session={self.session_id} elapsed="
+                        f"{self.state.get_interview_elapsed_seconds()}s"
+                    )
+                    hero = self.state.hero_phase().value
+                    self.gemini._system_instruction = build_system_prompt(self.state)
+                    await broadcast(self.session_id, {
+                        "type": "phase_change",
+                        "phase": self.state.current_phase.value,
+                        "turn": self.state.total_turns,
+                        "expression": _phase_to_expression(self.state.current_phase.value),
+                        "speaker": (self.state.interviewer or {}).get("name"),
+                    })
+                    await _speak_to_student(
+                        "[INTERNAL TIMING NOTE — keep interviewing, do NOT close yet] "
+                        f"We are only {self.state.get_interview_elapsed_seconds() // 60} minutes in. "
+                        f"The interview must continue until at least 25 minutes total. "
+                        f"Ask 2-3 deeper {hero} follow-up questions now. "
+                        "Do NOT give the final performance report yet.",
+                        force=True,
+                    )
 
         async def process_frame(self, frame, direction: FrameDirection):
             await super().process_frame(frame, direction)
-            if isinstance(frame, TranscriptionFrame):
-                self._last_user_text = frame.text or ""
-            elif isinstance(frame, TextFrame) and frame.text:
+            if isinstance(frame, LLMFullResponseStartFrame):
+                self.bot_state["responding"] = True
+            elif isinstance(frame, TranscriptionFrame) and frame.text:
+                chunk = frame.text.strip()
+                if chunk:
+                    self._last_user_text = f"{self._last_user_text} {chunk}".strip()
+            elif isinstance(frame, TTSTextFrame) and frame.text:
                 self._ai_text_parts.append(frame.text)
             elif isinstance(frame, LLMFullResponseEndFrame):
                 await self._on_turn_complete()
@@ -429,10 +511,9 @@ async def run_interview_pipeline(
             audio_in_sample_rate=16000,
             audio_out_sample_rate=24000,
             camera_out_enabled=False,
-            # stop_secs is how long we wait in silence before ending the
-            # student's turn. 2.5s lets the candidate think mid-answer
-            # without the AI cutting them off.
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=2.5)),
+            # stop_secs: wait ~2s of silence before ending the student's turn so
+            # they can think mid-answer without the AI jumping in immediately.
+            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=2.0)),
         ),
     )
 
@@ -442,6 +523,7 @@ async def run_interview_pipeline(
             model="models/gemini-3.1-flash-live-preview",
             voice="Charon",
             modalities=GeminiModalities.AUDIO,
+            temperature=0.7,
         ),
         system_instruction=initial_prompt,
         transcribe_user_audio=True,
@@ -452,9 +534,36 @@ async def run_interview_pipeline(
     context = LLMContext(messages=[
         {"role": "user", "content": "Please introduce yourself and start the interview now."}
     ])
-    context_aggregator = LLMContextAggregatorPair(context)
+    context_aggregator = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(user_turn_stop_timeout=2.0),
+    )
 
-    turn_processor = InterviewTurnProcessor(state=state, session_id=session_id, gemini=gemini)
+    student_speech: dict[str, str] = {"pending": ""}
+    bot_state: dict[str, bool] = {"responding": False}
+    last_activity_at: float = time.time()
+
+    user_aggregator = context_aggregator.user()
+
+    @user_aggregator.event_handler("on_user_turn_stopped")
+    async def on_user_turn_stopped(aggregator, strategy, message):
+        nonlocal last_activity_at
+        last_activity_at = time.time()
+        text = (message.content or "").strip()
+        if text and not text.startswith("[INTERNAL"):
+            student_speech["pending"] = text
+            logger.debug(
+                f"Student speech captured | session={session_id} chars={len(text)}"
+            )
+
+    turn_processor = InterviewTurnProcessor(
+        state=state,
+        session_id=session_id,
+        gemini=gemini,
+        context=context,
+        student_speech=student_speech,
+        bot_state=bot_state,
+    )
 
     task = PipelineTask(
         Pipeline([
@@ -465,7 +574,7 @@ async def run_interview_pipeline(
             transport.output(),
             context_aggregator.assistant(),
         ]),
-        params=PipelineParams(allow_interruptions=True, enable_metrics=True),
+        params=PipelineParams(allow_interruptions=True, enable_metrics=False),
     )
     turn_processor.task = task
 
@@ -473,11 +582,61 @@ async def run_interview_pipeline(
     # The no-show watchdog waits on this; if nothing fires within
     # NO_SHOW_TIMEOUT_SEC, the session ends without charging a credit.
     NO_SHOW_TIMEOUT_SEC = 5 * 60
+    RECONNECT_GRACE_SEC = 3 * 60  # 3 min to rejoin after internet drop
     participant_joined = asyncio.Event()
     student_participant_id: str | None = None
+    student_disconnected_at: float | None = None
+    disconnect_shutdown_task: asyncio.Task | None = None
+    credit_charged = False
     ending = False
+    silence_recovery_task = None
     watchdog_task = None
     time_watchdog_task = None
+
+    async def _handle_student_rejoin(participant: dict):
+        """Student reconnected after a brief disconnect — resume, don't end."""
+        nonlocal student_participant_id, student_disconnected_at
+        nonlocal disconnect_shutdown_task, last_activity_at
+
+        if disconnect_shutdown_task and not disconnect_shutdown_task.done():
+            disconnect_shutdown_task.cancel()
+            disconnect_shutdown_task = None
+
+        student_disconnected_at = None
+        student_participant_id = participant.get("id")
+        last_activity_at = time.time()
+        bot_state["responding"] = False
+
+        logger.info(f"Student reconnected | session={session_id} id={student_participant_id}")
+        await broadcast(session_id, {
+            "type": "session_reconnected",
+            "message": "Welcome back — resuming your interview.",
+            "phase": state.current_phase.value,
+        })
+        await _speak_to_student(
+            "[INTERNAL RECONNECTION NOTE — speak naturally] "
+            "The candidate's internet dropped briefly and they have rejoined. "
+            "In one warm sentence welcome them back, say where you are in the "
+            f"interview (current phase: {state.current_phase.value.replace('_', ' ')}), "
+            "and continue with your next question. Do NOT restart from the beginning.",
+            force=True,
+        )
+
+    async def _schedule_disconnect_shutdown():
+        """Wait RECONNECT_GRACE_SEC after disconnect before ending the session."""
+        nonlocal student_disconnected_at, disconnect_shutdown_task
+        try:
+            await asyncio.sleep(RECONNECT_GRACE_SEC)
+            if ending or student_disconnected_at is None:
+                return
+            logger.warning(
+                f"Reconnect grace expired | session={session_id} — ending interview"
+            )
+            await _shutdown_session("student_left")
+        except asyncio.CancelledError:
+            return
+        finally:
+            disconnect_shutdown_task = None
 
     async def _shutdown_session(reason: str):
         """Pause timers, persist state, and tear down the pipeline once."""
@@ -485,8 +644,9 @@ async def run_interview_pipeline(
         if ending:
             return
         ending = True
+        unregister_shutdown_handler(session_id)
 
-        for bg_task in (watchdog_task, time_watchdog_task):
+        for bg_task in (watchdog_task, time_watchdog_task, silence_recovery_task, disconnect_shutdown_task):
             if bg_task and not bg_task.done():
                 bg_task.cancel()
 
@@ -499,31 +659,42 @@ async def run_interview_pipeline(
 
     @transport.event_handler("on_first_participant_joined")
     async def on_first_join(transport, participant):
-        """When the student joins:
-        1. Mark the no-show watchdog satisfied.
-        2. Deduct one session credit (the user actually showed up).
-        3. Fire LLMRunFrame so Gemini speaks the seeded greeting.
-        """
-        nonlocal student_participant_id
+        """When the student joins for the first time."""
+        nonlocal student_participant_id, last_activity_at, credit_charged
         student_participant_id = participant.get("id")
         participant_joined.set()
         state.joined_at = time.time()
+        last_activity_at = time.time()
         logger.info(f"Student joined: {student_participant_id} — triggering greeting")
-        try:
-            current = supabase_admin.table("users").select(
-                "sessions_used"
-            ).eq("id", user_id).single().execute()
-            new_used = (current.data["sessions_used"] or 0) + 1
-            supabase_admin.table("users").update({
-                "sessions_used": new_used,
-            }).eq("id", user_id).execute()
-            logger.info(f"Credit deducted | user={user_id} sessions_used={new_used}")
-        except Exception as e:
-            logger.error(f"Failed to deduct credit: {e}")
+        if not credit_charged:
+            credit_charged = True
+            try:
+                current = supabase_admin.table("users").select(
+                    "sessions_used"
+                ).eq("id", user_id).single().execute()
+                new_used = (current.data["sessions_used"] or 0) + 1
+                supabase_admin.table("users").update({
+                    "sessions_used": new_used,
+                }).eq("id", user_id).execute()
+                logger.info(f"Credit deducted | user={user_id} sessions_used={new_used}")
+            except Exception as e:
+                logger.error(f"Failed to deduct credit: {e}")
         await task.queue_frames([LLMRunFrame()])
+
+    @transport.event_handler("on_participant_joined")
+    async def on_any_join(transport, participant):
+        """Handle reconnection after internet drop (not the first join)."""
+        if not _is_student_participant(participant, student_participant_id):
+            return
+        if not participant_joined.is_set():
+            return
+        if student_disconnected_at is None:
+            return
+        await _handle_student_rejoin(participant)
 
     @transport.event_handler("on_participant_left")
     async def on_left(transport, participant, reason):
+        nonlocal student_disconnected_at, disconnect_shutdown_task
         if not _is_student_participant(participant, student_participant_id):
             logger.debug(
                 f"Ignoring participant left (not student): {participant.get('id', 'unknown')}"
@@ -531,10 +702,29 @@ async def run_interview_pipeline(
             return
         if not participant_joined.is_set():
             return
+        if ending:
+            return
+
         logger.info(
-            f"Student left room (reason={reason}) — pausing and ending interview"
+            f"Student disconnected (reason={reason}) — "
+            f"{RECONNECT_GRACE_SEC}s reconnect window | session={session_id}"
         )
-        await _shutdown_session("student_left")
+        student_disconnected_at = time.time()
+        bot_state["responding"] = False
+
+        await broadcast(session_id, {
+            "type": "session_paused",
+            "reason": "disconnected",
+            "message": (
+                f"Connection lost. Rejoin within {RECONNECT_GRACE_SEC // 60} minutes "
+                "to continue your interview."
+            ),
+            "reconnect_seconds": RECONNECT_GRACE_SEC,
+        })
+
+        if disconnect_shutdown_task and not disconnect_shutdown_task.done():
+            disconnect_shutdown_task.cancel()
+        disconnect_shutdown_task = asyncio.create_task(_schedule_disconnect_shutdown())
 
     async def no_show_watchdog():
         """End the session if no student joins within NO_SHOW_TIMEOUT_SEC.
@@ -567,10 +757,17 @@ async def run_interview_pipeline(
     #   29:57 → short goodbye (3 sec before hard cap), then end gracefully
     # All three are gated on the student actually being in the call.
 
-    async def _speak_to_student(internal_note: str):
+    async def _speak_to_student(internal_note: str, force: bool = False):
         """Inject a synthetic user-side note into the LLM context and trigger
         Gemini to respond. This is how we make the AI proactively say
         something time-driven."""
+        if ending:
+            return
+        if bot_state["responding"] and not force:
+            logger.debug("Skipping timing injection — bot already responding")
+            return
+        if bot_state["responding"] and force:
+            bot_state["responding"] = False
         context.messages.append({"role": "user", "content": internal_note})
         await task.queue_frames([LLMRunFrame()])
 
@@ -597,12 +794,13 @@ async def run_interview_pipeline(
                 "[INTERNAL TIMING NOTE — speak this naturally to the candidate now] "
                 "We have about 5 minutes remaining in this interview. Briefly tell "
                 "the candidate this, wrap up your current question if any, and move "
-                "on to your final 1-2 questions before closing."
+                "on to your final 1-2 questions before closing.",
+                force=True,
             )
 
             # 28:30 — force jump to CLOSING phase
             await sleep_until(FORCE_CLOSE_AT)
-            if not state.is_complete() and state.current_phase != InterviewPhase.CLOSING:
+            if state.current_phase != InterviewPhase.CLOSING:
                 logger.info("Time watchdog: forcing CLOSING phase")
                 state.jump_to_phase(InterviewPhase.CLOSING)
                 gemini._system_instruction = build_system_prompt(state)
@@ -617,7 +815,8 @@ async def run_interview_pipeline(
                     "Time is almost up. Deliver your final performance report now, "
                     "concisely (about 60 seconds total). Hit all 6 closing points: "
                     "score, top 3 strengths, top 3 improvements, speech quality, "
-                    "honest verdict, next steps."
+                    "honest verdict, next steps.",
+                    force=True,
                 )
 
             # 29:57 — short goodbye, then hard end at 30:00
@@ -626,7 +825,8 @@ async def run_interview_pipeline(
             await _speak_to_student(
                 "[INTERNAL TIMING NOTE — final goodbye, one short line only] "
                 "Say exactly this in your voice and tone: "
-                "'Goodbye, all the best!' Then stop speaking."
+                "'Goodbye, all the best!' Then stop speaking.",
+                force=True,
             )
             await sleep_until(MAX_INTERVIEW_SEC)
             logger.info("Time watchdog: ending pipeline at hard cap")
@@ -637,6 +837,47 @@ async def run_interview_pipeline(
             logger.error(f"Time watchdog error: {e}")
 
     time_watchdog_task = asyncio.create_task(time_watchdog())
+
+    async def silence_recovery_watchdog():
+        """If the student speaks but the AI goes silent (stuck pipeline),
+        nudge Gemini to respond. Fixes 'Hello, are you there?' dead air."""
+        nonlocal last_activity_at
+        try:
+            await participant_joined.wait()
+            while not ending:
+                await asyncio.sleep(45)
+                if ending or not participant_joined.is_set():
+                    continue
+                idle_sec = time.time() - last_activity_at
+                if idle_sec < 75:
+                    continue
+                if bot_state["responding"]:
+                    # Stuck 'responding' flag — reset so pipeline can recover.
+                    if idle_sec > 120:
+                        logger.warning(
+                            f"Resetting stuck bot_state | session={session_id} "
+                            f"idle={idle_sec:.0f}s"
+                        )
+                        bot_state["responding"] = False
+                    continue
+                logger.warning(
+                    f"Silence recovery — nudging AI | session={session_id} "
+                    f"idle={idle_sec:.0f}s"
+                )
+                last_activity_at = time.time()
+                await _speak_to_student(
+                    "[INTERNAL RECOVERY NOTE — candidate may be waiting] "
+                    "The candidate may have said something or is waiting for you. "
+                    "Respond warmly right now. If you asked a question, rephrase it "
+                    "briefly. If they greeted you, greet them back and continue "
+                    "the interview with your next question.",
+                    force=True,
+                )
+        except asyncio.CancelledError:
+            return
+
+    silence_recovery_task = asyncio.create_task(silence_recovery_watchdog())
+    register_shutdown_handler(session_id, _shutdown_session)
 
     # Count this pipeline as live right before we run it, so it is always
     # paired with the _register_pipeline_end() in the finally below.
@@ -649,10 +890,10 @@ async def run_interview_pipeline(
         logger.error(f"Pipeline error: {e}")
         await _end_interview(state, reason="error")
     finally:
-        if watchdog_task and not watchdog_task.done():
-            watchdog_task.cancel()
-        if time_watchdog_task and not time_watchdog_task.done():
-            time_watchdog_task.cancel()
+        unregister_shutdown_handler(session_id)
+        for bg_task in (watchdog_task, time_watchdog_task, silence_recovery_task, disconnect_shutdown_task):
+            if bg_task and not bg_task.done():
+                bg_task.cancel()
         remove_session_state(session_id)
         remove_session_connections(session_id)
         # Daily's native context is process-wide. Only deinit when no other
