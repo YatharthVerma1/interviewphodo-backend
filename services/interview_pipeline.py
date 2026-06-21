@@ -11,7 +11,7 @@ import time
 from loguru import logger
 
 from config import settings
-from database.supabase_client import supabase_admin
+from database.supabase_client import fetch_one, supabase_admin
 
 # ---------------------------------------------------------------------------
 # Daily global-context guard.
@@ -126,20 +126,24 @@ from services.turn_scorer import score_turn
 
 
 def _fetch_past_company_history(
-    user_id: str, company: str, limit_sessions: int = 4
+    user_id: str,
+    company: str,
+    target_role: str | None = None,
+    limit_sessions: int = 4,
 ) -> tuple[list[str], int]:
-    """Pull this user's past sessions for the same company.
+    """Pull past sessions for same company (and role when set).
 
     Returns:
         past_topics      - AI questions already asked (for the 'do not repeat' rule).
-        completed_count  - how many completed sessions for this company → drives difficulty.
+        completed_count  - how many completed sessions → drives difficulty.
     """
     try:
-        rows = supabase_admin.table("sessions").select(
-            "transcript, status"
-        ).eq("user_id", user_id).eq("company", company).order(
-            "created_at", desc=True
-        ).limit(limit_sessions).execute()
+        query = supabase_admin.table("sessions").select(
+            "transcript, status, target_role"
+        ).eq("user_id", user_id).eq("company", company)
+        if target_role:
+            query = query.eq("target_role", target_role)
+        rows = query.order("created_at", desc=True).limit(limit_sessions).execute()
     except Exception as e:
         logger.error(f"Failed to fetch past sessions: {e}")
         return [], 0
@@ -450,7 +454,16 @@ async def run_interview_pipeline(
 
     logger.info(f"Pipeline start | session={session_id} company={company} round={round_type}")
 
-    past_topics, completed_count = _fetch_past_company_history(user_id, company)
+    user_row = fetch_one(
+        supabase_admin.table("users")
+        .select("target_role")
+        .eq("id", user_id)
+    )
+    target_role = (user_row or {}).get("target_role")
+
+    past_topics, completed_count = _fetch_past_company_history(
+        user_id, company, target_role=target_role
+    )
 
     # Difficulty: user override wins; otherwise auto-derive from session count
     if difficulty_override in ("easy", "medium", "hard"):
@@ -476,7 +489,7 @@ async def run_interview_pipeline(
 
     logger.info(
         f"Session start | prior_completed={completed_count} → difficulty={difficulty} | "
-        f"past_topics={len(past_topics)} | round={round_type}"
+        f"past_topics={len(past_topics)} | round={round_type} | role={target_role or 'general'}"
     )
 
     state = create_session_state(
@@ -489,6 +502,7 @@ async def run_interview_pipeline(
         interviewer=persona,
         personas_by_phase=personas_by_phase,
         difficulty_level=difficulty,
+        target_role=target_role,
     )
 
     try:

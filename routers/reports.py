@@ -5,6 +5,7 @@ from routers.auth import get_current_user
 from models.report import ReportResponse
 from database.supabase_client import fetch_one, supabase_admin
 from services.progress_tracker import build_user_progress
+from services.progress_adapter import adapt_progress_for_frontend, build_sessions_by_round
 from services.report_enricher import enrich_report_from_session
 from services.turn_scorer import build_turn_breakdown
 
@@ -65,14 +66,7 @@ async def get_session_turns(
         raise HTTPException(403, "Not authorized")
 
     breakdown = build_turn_breakdown(session.get("transcript") or [])
-    return {
-        "session_id":     session_id,
-        "company":        session.get("company"),
-        "round_type":     session.get("round_type"),
-        "status":         session.get("status"),
-        "turn_breakdown": breakdown,
-        "total_scored":   len(breakdown),
-    }
+    return breakdown
 
 
 @router.get("/my-progress")
@@ -100,7 +94,9 @@ async def my_progress(
     }:
         raise HTTPException(400, "Invalid company filter")
 
-    return build_user_progress(current_user["id"], company=company)
+    data = build_user_progress(current_user["id"], company=company)
+    data["sessions_by_round"] = build_sessions_by_round(current_user["id"])
+    return adapt_progress_for_frontend(data)
 
 
 @router.get("/my-reports")
@@ -123,8 +119,12 @@ async def my_reports(
         ).in_("id", session_ids).execute()
         sessions_by_id = {s["id"]: s for s in (sess_rows.data or [])}
 
-    enriched = [
-        enrich_report_from_session(r, sessions_by_id.get(r["session_id"]))
-        for r in (rows.data or [])
-    ]
+    enriched = []
+    for r in (rows.data or []):
+        sess = sessions_by_id.get(r["session_id"])
+        item = enrich_report_from_session(r, sess)
+        if sess:
+            item["company"] = sess.get("company")
+            item["round_type"] = sess.get("round_type")
+        enriched.append(item)
     return enriched

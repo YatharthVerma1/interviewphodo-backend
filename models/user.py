@@ -11,6 +11,8 @@ class UserProfile(BaseModel):
     branch: Optional[str] = None
     graduation_year: Optional[int] = None
     resume_url: Optional[str] = None
+    target_role: Optional[str] = None
+    interview_timeline: Optional[str] = None
     sessions_used: int = 0
     sessions_limit: int = 2
     plan: str = "free"
@@ -22,3 +24,5 @@ class UserUpdateRequest(BaseModel):
     college: Optional[str] = None
     branch: Optional[str] = None
     graduation_year: Optional[int] = None
+    target_role: Optional[str] = None
+    interview_timeline: Optional[str] = None

@@ -5,6 +5,7 @@ Rebuilds the Gemini system prompt on every phase transition.
 
 from services.interview_fsm import InterviewPhase, InterviewState
 from prompts.companies import get_company_config
+from prompts.role_pools import build_role_prompt_block
 
 FILLER_WORDS = [
     "um", "uh", "like", "basically", "actually", "you know",
@@ -270,8 +271,9 @@ def build_system_prompt(state: InterviewState) -> str:
     config = get_company_config(state.company)
 
     past_topics_block = _format_past_topics(state.past_topics)
+    role_block = build_role_prompt_block(state.target_role)
 
-    # Persona for the CURRENT phase. In normal rounds this is constant; in
+    # Persona for the CURRENT phase.
     # multi_persona rounds it changes per phase. `state.persona_for_phase()`
     # always returns the right one to use right now.
     persona = state.persona_for_phase() or state.interviewer or {
@@ -297,6 +299,7 @@ COMPANY INTERVIEW STYLE: {config['style']}
 {difficulty_block}
 {coaching_block}
 {past_topics_block}
+{role_block}
 ABSOLUTE RULES — APPLY IN EVERY PHASE:
 1. You are a professional interviewer. NOT a chatbot, tutor, or general assistant.
    Never break character. Never say "As an AI" or "I am a language model."

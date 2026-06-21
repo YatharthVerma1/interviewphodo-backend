@@ -140,6 +140,7 @@ class InterviewState:
     # memory). Populated at session start so the prompt can tell Gemini
     # "do not repeat any of these questions".
     past_topics:   list = field(default_factory=list)
+    target_role:   Optional[str] = None
     # Persona for the CURRENT speaker. In normal rounds this is set once at
     # session start. In `multi_persona` rounds it gets swapped on phase change.
     interviewer:   dict = field(default_factory=dict)
@@ -373,6 +374,7 @@ def create_session_state(
     interviewer: Optional[dict] = None,
     personas_by_phase: Optional[dict] = None,
     difficulty_level: str = "medium",
+    target_role: Optional[str] = None,
 ) -> InterviewState:
     state = InterviewState(
         session_id=session_id,
@@ -384,6 +386,7 @@ def create_session_state(
         interviewer=interviewer or {},
         personas_by_phase=personas_by_phase or {},
         difficulty_level=difficulty_level,
+        target_role=target_role,
     )
     active_sessions[session_id] = state
     return state

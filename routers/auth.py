@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from database.supabase_client import supabase_admin
 from models.user import UserProfile, UserUpdateRequest
+from prompts.role_pools import normalize_target_role, normalize_timeline
 from config import settings
 
 LOCAL_UPLOAD_ROOT = Path(__file__).resolve().parent.parent / "uploads" / "resumes"
@@ -64,32 +65,52 @@ async def update_profile(
     updates: UserUpdateRequest,
     current_user: dict = Depends(get_current_user)
 ):
-    result = supabase_admin.table("users") \
-        .update(updates.model_dump(exclude_none=True)) \
-        .eq("id", current_user["id"]) \
-        .execute()
-    return result.data[0]
+    payload = updates.model_dump(exclude_none=True)
+    if "target_role" in payload:
+        payload["target_role"] = normalize_target_role(payload["target_role"])
+    if "interview_timeline" in payload:
+        payload["interview_timeline"] = normalize_timeline(payload["interview_timeline"])
+    if not payload:
+        return current_user
+    try:
+        result = supabase_admin.table("users") \
+            .update(payload) \
+            .eq("id", current_user["id"]) \
+            .execute()
+        return result.data[0]
+    except Exception:
+        # Graceful fallback if migration 003 not applied yet
+        payload.pop("target_role", None)
+        payload.pop("interview_timeline", None)
+        if not payload:
+            return current_user
+        result = supabase_admin.table("users") \
+            .update(payload) \
+            .eq("id", current_user["id"]) \
+            .execute()
+        return result.data[0]
 
 
 @router.post("/upload-resume")
 async def upload_resume(
-     request: Request,
-    file: UploadFile = File(...),
+    request: Request,
     current_user: dict = Depends(get_current_user),
+    file: UploadFile | None = File(None),
+    resume: UploadFile | None = File(None),
 ):
     """
     Student uploads resume PDF.
 
-    - If Cloudflare R2 is configured -> uploads to R2.
-    - Otherwise -> saves to local ``uploads/resumes/`` folder (dev fallback).
-
-    In both cases the PDF text is extracted and saved on the user row so the
-    interviewer prompt can reference the candidate's projects.
+    Accepts form field ``file`` (OpenAPI default) or ``resume`` (Replit frontend).
     """
-    if not file.filename or not file.filename.lower().endswith(".pdf"):
+    upload = file or resume
+    if upload is None:
+        raise HTTPException(400, "Missing file — use form field 'file' or 'resume'")
+
+    if not upload.filename or not upload.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Only PDF files accepted")
 
-    content = await file.read()
+    content = await upload.read()
 
     if len(content) > 5 * 1024 * 1024:
         raise HTTPException(400, "File too large — max 5MB")

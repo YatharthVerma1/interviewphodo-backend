@@ -9,7 +9,7 @@ from models.session import SessionStartRequest, SessionResponse, PostureEventReq
 from services.daily_service import create_interview_room
 from services.interview_pipeline import request_pipeline_shutdown, run_interview_pipeline
 from services.interview_fsm import get_session_state
-from prompts.companies import VALID_COMPANIES
+from prompts.role_pools import normalize_target_role
 from database.supabase_client import fetch_one, supabase_admin
 from config import settings
 
@@ -77,7 +77,7 @@ async def start_session(
     # join their session are not charged).
     ud = fetch_one(
         supabase_admin.table("users")
-        .select("sessions_used, sessions_limit, resume_text")
+        .select("sessions_used, sessions_limit, resume_text, target_role")
         .eq("id", current_user["id"])
     )
     if not ud:
@@ -95,15 +95,25 @@ async def start_session(
     except Exception as e:
         raise HTTPException(500, f"Room creation failed: {str(e)}")
 
+    target_role = normalize_target_role(ud.get("target_role"))
+
     # Insert session row
-    row = supabase_admin.table("sessions").insert({
+    session_row: dict = {
         "user_id":         current_user["id"],
         "company":         company,
         "round_type":      round_type,
         "status":          "pending",
         "daily_room_url":  room["url"],
         "daily_room_name": room["name"],
-    }).execute()
+    }
+    if target_role:
+        session_row["target_role"] = target_role
+
+    try:
+        row = supabase_admin.table("sessions").insert(session_row).execute()
+    except Exception:
+        session_row.pop("target_role", None)
+        row = supabase_admin.table("sessions").insert(session_row).execute()
 
     session_id = row.data[0]["id"]
 
@@ -213,11 +223,33 @@ async def my_sessions(
 ):
     rows = supabase_admin.table("sessions").select(
         "id, company, round_type, status, current_phase, "
-        "total_turns, duration_seconds, started_at, ended_at"
+        "total_turns, duration_seconds, started_at, ended_at, created_at"
     ).eq("user_id", current_user["id"]).order(
         "created_at", desc=True
     ).limit(limit).execute()
-    return rows.data
+
+    session_list = rows.data or []
+    session_ids = [s["id"] for s in session_list]
+
+    scores_by_session: dict[str, float | None] = {}
+    if session_ids:
+        report_rows = supabase_admin.table("reports").select(
+            "session_id, overall_score"
+        ).in_("session_id", session_ids).execute()
+        for r in report_rows.data or []:
+            scores_by_session[r["session_id"]] = r.get("overall_score")
+
+    return [
+        {
+            "session_id":    s["id"],
+            "company":       s.get("company"),
+            "round_type":    s.get("round_type"),
+            "status":        s.get("status"),
+            "created_at":    s.get("created_at") or s.get("started_at"),
+            "overall_score": scores_by_session.get(s["id"]),
+        }
+        for s in session_list
+    ]
 
 
 @router.get("/next-recommended")
