@@ -40,6 +40,37 @@ _TECH_KEYWORDS = (
 )
 
 
+_NON_ANSWER_PHRASES = frozenset({
+    "ok", "okay", "k", "yes", "yeah", "yep", "yup", "yah", "ya",
+    "no", "nope", "nah", "hmm", "hm", "uh", "um", "er", "ah",
+    "right", "sure", "fine", "cool", "nice", "good", "great", "perfect",
+    "got it", "i see", "understood", "makes sense", "alright", "all right",
+    "continue", "go on", "go ahead", "next", "carry on", "please continue",
+    "tell me more", "mm", "mmm", "mhm", "huh",
+})
+
+
+def is_non_substantive_answer(student_text: str) -> bool:
+    """True when the student did not actually answer the interview question."""
+    raw = (student_text or "").strip().lower()
+    if not raw:
+        return True
+    normalized = re.sub(r"[^\w\s']", "", raw).strip()
+    if not normalized:
+        return True
+    if normalized in _NON_ANSWER_PHRASES:
+        return True
+    words = normalized.split()
+    if len(words) <= 3 and all(w in _NON_ANSWER_PHRASES for w in words):
+        return True
+    # Single short acknowledgment ("okay okay", "yes yes")
+    if len(words) <= 2 and len(normalized) < 20:
+        unique = set(words)
+        if unique.issubset(_NON_ANSWER_PHRASES):
+            return True
+    return len(words) == 1 and len(normalized) < 15
+
+
 def score_turn(
     phase: str,
     student_text: str,
@@ -56,6 +87,13 @@ def score_turn(
 
     if not student:
         return 2, "No answer detected — in a real interview, always attempt an answer rather than staying silent."
+
+    if is_non_substantive_answer(student):
+        return (
+            2,
+            "That was not a real answer — only an acknowledgment. In a real interview, "
+            "you must actually respond to the question with substance.",
+        )
 
     score = _parse_score_from_ai(ai)
     feedback = _extract_feedback(ai, score)

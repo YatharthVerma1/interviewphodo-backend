@@ -55,58 +55,57 @@ HERO_PHASE_BY_ROUND: dict[str, InterviewPhase] = {
 }
 
 # Per-round phase plan: (phase, turns_in_phase).
-# Turn budgets target ~35–50 min of content at ~35–45 sec/turn so the FSM
-# does not exhaust before the 25-min wall-clock minimum. The time watchdog
-# still enforces the hard 30-min cap.
+# Turn budgets target ~25–30 min at ~25–40 sec/turn. Doubled from V1 so fast
+# answers do not exhaust content before the 25-min wall-clock minimum.
 ROUND_PHASE_PLAN: dict[str, list[tuple["InterviewPhase", int]]] = {
     "technical": [
         (InterviewPhase.INTRO,        3),
-        (InterviewPhase.RESUME,       5),
-        (InterviewPhase.TECHNICAL,   14),
-        (InterviewPhase.BEHAVIORAL,   6),
-        (InterviewPhase.CANDIDATE_QA, 4),
+        (InterviewPhase.RESUME,      10),
+        (InterviewPhase.TECHNICAL,   28),
+        (InterviewPhase.BEHAVIORAL,  12),
+        (InterviewPhase.CANDIDATE_QA, 6),
         (InterviewPhase.CLOSING,      4),
     ],
     "managerial": [
         (InterviewPhase.INTRO,        3),
-        (InterviewPhase.RESUME,       6),
-        (InterviewPhase.BEHAVIORAL,  14),
-        (InterviewPhase.CANDIDATE_QA, 5),
+        (InterviewPhase.RESUME,      12),
+        (InterviewPhase.BEHAVIORAL,  28),
+        (InterviewPhase.CANDIDATE_QA, 8),
         (InterviewPhase.CLOSING,      4),
     ],
     "hr": [
         (InterviewPhase.INTRO,        3),
-        (InterviewPhase.RESUME,       5),
-        (InterviewPhase.HR_ROUND,    14),
-        (InterviewPhase.BEHAVIORAL,   6),
-        (InterviewPhase.CANDIDATE_QA, 4),
+        (InterviewPhase.RESUME,      10),
+        (InterviewPhase.HR_ROUND,    28),
+        (InterviewPhase.BEHAVIORAL,  12),
+        (InterviewPhase.CANDIDATE_QA, 6),
         (InterviewPhase.CLOSING,      4),
     ],
     "full": [
         (InterviewPhase.INTRO,        3),
-        (InterviewPhase.RESUME,       6),
-        (InterviewPhase.TECHNICAL,   10),
-        (InterviewPhase.BEHAVIORAL,   8),
-        (InterviewPhase.HR_ROUND,     8),
-        (InterviewPhase.CANDIDATE_QA, 5),
+        (InterviewPhase.RESUME,      12),
+        (InterviewPhase.TECHNICAL,   20),
+        (InterviewPhase.BEHAVIORAL,  16),
+        (InterviewPhase.HR_ROUND,    16),
+        (InterviewPhase.CANDIDATE_QA, 8),
         (InterviewPhase.CLOSING,      4),
     ],
     "coaching": [
         (InterviewPhase.INTRO,        3),
-        (InterviewPhase.RESUME,       5),
-        (InterviewPhase.TECHNICAL,    6),
-        (InterviewPhase.BEHAVIORAL,   6),
-        (InterviewPhase.HR_ROUND,     6),
-        (InterviewPhase.CANDIDATE_QA, 4),
+        (InterviewPhase.RESUME,      10),
+        (InterviewPhase.TECHNICAL,   12),
+        (InterviewPhase.BEHAVIORAL,  12),
+        (InterviewPhase.HR_ROUND,    12),
+        (InterviewPhase.CANDIDATE_QA, 6),
         (InterviewPhase.CLOSING,      4),
     ],
     "multi_persona": [
         (InterviewPhase.INTRO,        3),
-        (InterviewPhase.RESUME,       6),
-        (InterviewPhase.TECHNICAL,    8),
-        (InterviewPhase.BEHAVIORAL,   7),
-        (InterviewPhase.HR_ROUND,     7),
-        (InterviewPhase.CANDIDATE_QA, 4),
+        (InterviewPhase.RESUME,      12),
+        (InterviewPhase.TECHNICAL,   16),
+        (InterviewPhase.BEHAVIORAL,  14),
+        (InterviewPhase.HR_ROUND,    14),
+        (InterviewPhase.CANDIDATE_QA, 6),
         (InterviewPhase.CLOSING,      4),
     ],
 }
@@ -152,6 +151,7 @@ class InterviewState:
     # for THIS company before: 'easy' (first try), 'medium', or 'hard'.
     # Can be overridden by user-supplied value at session start.
     difficulty_level: str = "medium"
+    dynamic_injection_count: int = 0
     started_at:    float = field(default_factory=time.time)
     # Set when the student actually joins the Daily room (interview clock starts).
     joined_at:     Optional[float] = None
@@ -169,10 +169,22 @@ class InterviewState:
         except ValueError:
             return False
         if idx < len(self.phase_order) - 1:
-            self.current_phase = self.phase_order[idx + 1]
+            next_phase = self.phase_order[idx + 1]
+            if next_phase == InterviewPhase.CLOSING and self.should_block_closing():
+                logger.info(
+                    f"Blocking early CLOSING | session={self.session_id} "
+                    f"elapsed={self.get_interview_elapsed_seconds()}s"
+                )
+                return False
+            self.current_phase = next_phase
             self.phase_turn = 0
             return True
         return False
+
+    def should_block_closing(self) -> bool:
+        """Do not enter CLOSING until ~23 min — prevents early report + silence."""
+        from services.interview_timing import MIN_INTERVIEW_SEC
+        return self.get_interview_elapsed_seconds() < (MIN_INTERVIEW_SEC - 120)
 
     def jump_to_phase(self, phase: "InterviewPhase") -> bool:
         """Skip ahead to a specific phase (used by the time watchdog to
@@ -221,7 +233,7 @@ class InterviewState:
             return int(time.time() - self.joined_at)
         return self.get_duration_seconds()
 
-    def extend_if_under_minimum(self, min_sec: int, extra_turns: int = 6) -> bool:
+    def extend_if_under_minimum(self, min_sec: int, extra_turns: int = 10) -> bool:
         """Keep the interview going until the 25-min wall-clock minimum is met.
 
         When the FSM runs out of turns too quickly (common with fast answers),
@@ -249,6 +261,27 @@ class InterviewState:
         )
         return True
 
+    def extend_current_phase(self, extra_turns: int = 4) -> None:
+        """Add turns to the active phase when CLOSING is blocked or pacing is ahead."""
+        self.phase_budgets[self.current_phase] = self.phase_turn + extra_turns
+        logger.info(
+            f"Phase extended | session={self.session_id} "
+            f"phase={self.current_phase.value} +{extra_turns} turns"
+        )
+
+    def total_turn_budget(self) -> int:
+        return sum(self.phase_budgets.values())
+
+    def pacing_ahead_of_schedule(self) -> bool:
+        """True when turn consumption is faster than the 25-min target pace."""
+        from services.interview_timing import MIN_INTERVIEW_SEC
+        elapsed = self.get_interview_elapsed_seconds()
+        if elapsed >= MIN_INTERVIEW_SEC or self.total_turns < 3:
+            return False
+        progress = elapsed / MIN_INTERVIEW_SEC
+        expected_turns = int(self.total_turn_budget() * progress * 0.75)
+        return self.total_turns >= max(expected_turns + 4, 8)
+
     def record_turn(
         self,
         student_text: str,
@@ -256,6 +289,7 @@ class InterviewState:
         score: Optional[int] = None,
         feedback: Optional[str] = None,
         filler_words: Optional[list] = None,
+        counts_toward_phase: bool = True,
     ):
         self.transcript.append({
             "turn": self.total_turns + 1,
@@ -265,13 +299,15 @@ class InterviewState:
             "score": score,
             "feedback": feedback or "",
             "filler_words": filler_words or [],
+            "substantive": counts_toward_phase,
             "timestamp": time.time(),
         })
-        if score is not None:
+        if score is not None and counts_toward_phase:
             self.phase_scores.setdefault(self.current_phase.value, []).append(score)
         if filler_words:
             self.filler_count += len(filler_words)
-        self.phase_turn += 1
+        if counts_toward_phase:
+            self.phase_turn += 1
         self.total_turns += 1
 
     def add_posture_event(self, event_type: str, message: str):

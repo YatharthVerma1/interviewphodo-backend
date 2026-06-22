@@ -12,6 +12,7 @@ from loguru import logger
 
 from config import settings
 from database.supabase_client import fetch_one, supabase_admin
+from services.credits import is_owner_user
 
 # ---------------------------------------------------------------------------
 # Daily global-context guard.
@@ -107,6 +108,7 @@ from prompts.companies import (
 )
 from prompts.fsm_prompt_builder import build_system_prompt
 from services.avatar_broadcaster import broadcast, remove_session_connections
+from services.dynamic_questions import build_mid_interview_injection
 from services.interview_fsm import (
     InterviewPhase,
     InterviewState,
@@ -122,7 +124,7 @@ from services.interview_timing import (
     WARN_5MIN_AT,
 )
 from services.speech_analyser import detect_fillers_combined
-from services.turn_scorer import score_turn
+from services.turn_scorer import score_turn, is_non_substantive_answer
 
 
 def _fetch_past_company_history(
@@ -188,7 +190,7 @@ async def _sync_state_to_db(state: InterviewState):
 
 
 async def _end_interview(state: InterviewState, reason: str = "completed"):
-    from services.report_generator import generate_report
+    from services.report_generator import generate_report, REPORT_GENERATION_REASONS
 
     try:
         supabase_admin.table("sessions").update({
@@ -198,10 +200,7 @@ async def _end_interview(state: InterviewState, reason: str = "completed"):
             "duration_seconds": state.get_interview_elapsed_seconds(),
         }).eq("id", state.session_id).execute()
 
-        if reason == "completed" and state.total_turns >= 4:
-            await generate_report(state)
-        elif reason == "student_left" and state.total_turns >= 3:
-            # Partial report when the student leaves after a real conversation.
+        if reason in REPORT_GENERATION_REASONS and (state.total_turns >= 1 or state.transcript):
             await generate_report(state)
     except Exception as e:
         logger.error(f"End interview error: {e}")
@@ -269,9 +268,11 @@ async def run_interview_pipeline(
             LLMUserAggregatorParams,
         )
         from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-        from pipecat.services.google.gemini_live.llm import (
-            GeminiLiveLLMService,
-            GeminiModalities,
+        from pipecat.services.google.gemini_live.llm import GeminiModalities
+        from services.gemini_interview_llm import (
+            GEMINI_LIVE_MODEL,
+            InterviewGeminiLiveLLMService,
+            default_interview_gemini_settings,
         )
         from pipecat.transports.services.daily import DailyParams, DailyTransport
     except ImportError as e:
@@ -320,6 +321,13 @@ async def run_interview_pipeline(
             self.student_speech["pending"] = ""
             self._last_user_text = ""
 
+            if student_text:
+                await broadcast(self.session_id, {
+                    "type": "user_text",
+                    "text": student_text,
+                    "phase": self.state.current_phase.value,
+                })
+
             fillers = detect_fillers_combined(student_text, ai_text)
             turn_score, turn_feedback = score_turn(
                 phase=self.state.current_phase.value,
@@ -327,13 +335,61 @@ async def run_interview_pipeline(
                 ai_text=ai_text,
                 filler_words=fillers,
             )
+
+            phase = self.state.current_phase.value
+            answer_required = phase not in {"intro", "candidate_qa", "closing"}
+            substantive = (
+                answer_required
+                and student_text
+                and not is_non_substantive_answer(student_text)
+            ) or not answer_required
+
             self.state.record_turn(
                 student_text=student_text,
                 ai_text=ai_text,
                 score=turn_score,
                 feedback=turn_feedback,
                 filler_words=fillers,
+                counts_toward_phase=substantive,
             )
+
+            if answer_required and student_text and not substantive:
+                logger.info(
+                    f"Non-substantive answer blocked | session={self.session_id} "
+                    f"phase={phase} text={student_text!r}"
+                )
+                if turn_score is not None:
+                    await broadcast(self.session_id, {
+                        "type": "turn_feedback",
+                        "turn": self.state.total_turns,
+                        "phase": phase,
+                        "score": turn_score,
+                        "feedback": turn_feedback,
+                    })
+                await broadcast(self.session_id, {
+                    "type": "ai_text",
+                    "text": ai_text,
+                    "phase": phase,
+                })
+                await broadcast(self.session_id, {
+                    "type": "ai_text_final",
+                    "text": ai_text,
+                    "phase": phase,
+                })
+                self.gemini._system_instruction = build_system_prompt(self.state)
+                await _speak_to_student(
+                    "[INTERNAL — CANDIDATE DID NOT ANSWER] "
+                    "The student only said a filler like 'okay', 'yes', or 'hmm' — "
+                    "that is NOT an answer to your question. "
+                    "Do NOT praise them. Do NOT say 'good answer' or 'well explained'. "
+                    "Firmly tell them: 'That is not an answer — please actually respond "
+                    "to my question.' Then repeat or rephrase the SAME question. "
+                    "Stay on this question until they give a real substantive answer.",
+                    force=True,
+                )
+                if self.state.total_turns % 3 == 0:
+                    await _sync_state_to_db(self.state)
+                return
 
             if turn_score is not None:
                 await broadcast(self.session_id, {
@@ -359,6 +415,11 @@ async def run_interview_pipeline(
                 "text": ai_text,
                 "phase": self.state.current_phase.value,
             })
+            await broadcast(self.session_id, {
+                "type": "ai_text_final",
+                "text": ai_text,
+                "phase": self.state.current_phase.value,
+            })
 
             if fillers:
                 await broadcast(self.session_id, {
@@ -367,42 +428,57 @@ async def run_interview_pipeline(
                     "total_count": self.state.filler_count,
                 })
 
-            if self.state.should_advance() and self.state.advance_phase():
-                logger.info(f"Phase → {self.state.current_phase.value}")
+            if self.state.should_advance():
+                advanced = self.state.advance_phase()
+                if not advanced and self.state.should_block_closing():
+                    self.state.extend_current_phase(extra_turns=6)
+                    injection = build_mid_interview_injection(self.state)
+                    self.state.dynamic_injection_count += 1
+                    self.gemini._system_instruction = build_system_prompt(self.state)
+                    await _speak_to_student(injection, force=True)
+                elif advanced:
+                    logger.info(f"Phase → {self.state.current_phase.value}")
 
-                # Multi-persona round: if the new phase is owned by a different
-                # persona, swap state.interviewer and announce the handoff so
-                # the candidate hears something like "I'll hand you over to my
-                # colleague Karthik now."
-                handoff_note = None
-                if self.state.personas_by_phase:
-                    new_persona = self.state.persona_for_phase()
-                    prev_name = (self.state.interviewer or {}).get("name")
-                    if new_persona and new_persona.get("name") != prev_name:
-                        handoff_note = (
-                            "[INTERNAL CONTROL — INTERVIEWER HANDOFF] "
-                            f"You have just finished your portion of this panel interview. "
-                            f"Briefly thank the candidate for their answers (one short sentence) "
-                            f"and say: 'I will now hand you over to my colleague "
-                            f"{new_persona['name']}, who is our {new_persona['role']}. They will "
-                            f"continue the interview with you.' "
-                            f"After speaking that sentence, from the NEXT turn onward you ARE "
-                            f"{new_persona['name']}, a {new_persona['role']}, with this style: "
-                            f"{new_persona['personality']}. Open with a short, warm self-introduction "
-                            f"in your new persona's voice, then move to the next phase."
-                        )
-                        self.state.interviewer = new_persona
+                    # Multi-persona round: if the new phase is owned by a different
+                    # persona, swap state.interviewer and announce the handoff so
+                    # the candidate hears something like "I'll hand you over to my
+                    # colleague Karthik now."
+                    handoff_note = None
+                    if self.state.personas_by_phase:
+                        new_persona = self.state.persona_for_phase()
+                        prev_name = (self.state.interviewer or {}).get("name")
+                        if new_persona and new_persona.get("name") != prev_name:
+                            handoff_note = (
+                                "[INTERNAL CONTROL — INTERVIEWER HANDOFF] "
+                                f"You have just finished your portion of this panel interview. "
+                                f"Briefly thank the candidate for their answers (one short sentence) "
+                                f"and say: 'I will now hand you over to my colleague "
+                                f"{new_persona['name']}, who is our {new_persona['role']}. They will "
+                                f"continue the interview with you.' "
+                                f"After speaking that sentence, from the NEXT turn onward you ARE "
+                                f"{new_persona['name']}, a {new_persona['role']}, with this style: "
+                                f"{new_persona['personality']}. Open with a short, warm self-introduction "
+                                f"in your new persona's voice, then move to the next phase."
+                            )
+                            self.state.interviewer = new_persona
 
+                    self.gemini._system_instruction = build_system_prompt(self.state)
+                    await broadcast(self.session_id, {
+                        "type": "phase_change",
+                        "phase":      self.state.current_phase.value,
+                        "turn":       self.state.total_turns,
+                        "expression": _phase_to_expression(self.state.current_phase.value),
+                        "speaker":    (self.state.interviewer or {}).get("name"),
+                    })
+                    if handoff_note:
+                        await _speak_to_student(handoff_note)
+
+            elif self.state.pacing_ahead_of_schedule() and not self.state.should_block_closing():
+                self.state.extend_current_phase(extra_turns=4)
+                injection = build_mid_interview_injection(self.state)
+                self.state.dynamic_injection_count += 1
                 self.gemini._system_instruction = build_system_prompt(self.state)
-                await broadcast(self.session_id, {
-                    "type": "phase_change",
-                    "phase":      self.state.current_phase.value,
-                    "turn":       self.state.total_turns,
-                    "expression": _phase_to_expression(self.state.current_phase.value),
-                    "speaker":    (self.state.interviewer or {}).get("name"),
-                })
-                if handoff_note:
-                    await _speak_to_student(handoff_note)
+                await _speak_to_student(injection, force=True)
 
             if self.state.total_turns % 3 == 0:
                 await _sync_state_to_db(self.state)
@@ -448,6 +524,11 @@ async def run_interview_pipeline(
                     self._last_user_text = f"{self._last_user_text} {chunk}".strip()
             elif isinstance(frame, TTSTextFrame) and frame.text:
                 self._ai_text_parts.append(frame.text)
+                await broadcast(self.session_id, {
+                    "type": "ai_text_delta",
+                    "text": frame.text,
+                    "phase": self.state.current_phase.value,
+                })
             elif isinstance(frame, LLMFullResponseEndFrame):
                 await self._on_turn_complete()
             await self.push_frame(frame, direction)
@@ -456,10 +537,13 @@ async def run_interview_pipeline(
 
     user_row = fetch_one(
         supabase_admin.table("users")
-        .select("target_role")
+        .select("target_role, email")
         .eq("id", user_id)
     )
     target_role = (user_row or {}).get("target_role")
+    owner_account = is_owner_user(user_row)
+    if owner_account:
+        logger.info(f"Owner account — session credit will not be deducted | user={user_id}")
 
     past_topics, completed_count = _fetch_past_company_history(
         user_id, company, target_role=target_role
@@ -531,17 +615,16 @@ async def run_interview_pipeline(
         ),
     )
 
-    gemini = GeminiLiveLLMService(
+    gemini = InterviewGeminiLiveLLMService(
         api_key=settings.google_api_key,
-        settings=GeminiLiveLLMService.Settings(
-            model="models/gemini-3.1-flash-live-preview",
-            voice="Charon",
+        settings=default_interview_gemini_settings(
+            model=GEMINI_LIVE_MODEL,
             modalities=GeminiModalities.AUDIO,
-            temperature=0.7,
         ),
         system_instruction=initial_prompt,
         transcribe_user_audio=True,
     )
+    logger.info(f"Gemini Live | model={GEMINI_LIVE_MODEL} reconnect=goAway-only")
 
     # Context holds the conversation history. We seed it with one user message
     # so Gemini speaks the greeting first (inference_on_context_initialization).
@@ -660,7 +743,7 @@ async def run_interview_pipeline(
         ending = True
         unregister_shutdown_handler(session_id)
 
-        for bg_task in (watchdog_task, time_watchdog_task, silence_recovery_task, disconnect_shutdown_task):
+        for bg_task in (watchdog_task, time_watchdog_task, pacing_watchdog_task, silence_recovery_task, disconnect_shutdown_task):
             if bg_task and not bg_task.done():
                 bg_task.cancel()
 
@@ -682,17 +765,20 @@ async def run_interview_pipeline(
         logger.info(f"Student joined: {student_participant_id} — triggering greeting")
         if not credit_charged:
             credit_charged = True
-            try:
-                current = supabase_admin.table("users").select(
-                    "sessions_used"
-                ).eq("id", user_id).single().execute()
-                new_used = (current.data["sessions_used"] or 0) + 1
-                supabase_admin.table("users").update({
-                    "sessions_used": new_used,
-                }).eq("id", user_id).execute()
-                logger.info(f"Credit deducted | user={user_id} sessions_used={new_used}")
-            except Exception as e:
-                logger.error(f"Failed to deduct credit: {e}")
+            if owner_account:
+                logger.info(f"Owner bypass — no credit deducted | user={user_id}")
+            else:
+                try:
+                    current = supabase_admin.table("users").select(
+                        "sessions_used"
+                    ).eq("id", user_id).single().execute()
+                    new_used = (current.data["sessions_used"] or 0) + 1
+                    supabase_admin.table("users").update({
+                        "sessions_used": new_used,
+                    }).eq("id", user_id).execute()
+                    logger.info(f"Credit deducted | user={user_id} sessions_used={new_used}")
+                except Exception as e:
+                    logger.error(f"Failed to deduct credit: {e}")
         await task.queue_frames([LLMRunFrame()])
 
     @transport.event_handler("on_participant_joined")
@@ -772,9 +858,10 @@ async def run_interview_pipeline(
     # All three are gated on the student actually being in the call.
 
     async def _speak_to_student(internal_note: str, force: bool = False):
-        """Inject a synthetic user-side note into the LLM context and trigger
-        Gemini to respond. This is how we make the AI proactively say
-        something time-driven."""
+        """Inject a control note and trigger Gemini to speak.
+
+        Uses send_client_content so prompts still work after goAway reconnects.
+        """
         if ending:
             return
         if bot_state["responding"] and not force:
@@ -783,7 +870,30 @@ async def run_interview_pipeline(
         if bot_state["responding"] and force:
             bot_state["responding"] = False
         context.messages.append({"role": "user", "content": internal_note})
-        await task.queue_frames([LLMRunFrame()])
+        sent = await gemini.send_control_turn(internal_note)
+        if not sent:
+            logger.warning(f"send_control_turn failed — falling back to LLMRunFrame | session={session_id}")
+            await task.queue_frames([LLMRunFrame()])
+
+    async def _after_gemini_reconnect():
+        nonlocal last_activity_at
+        if ending:
+            return
+        bot_state["responding"] = False
+        last_activity_at = time.time()
+        gemini._system_instruction = build_system_prompt(state)
+        await broadcast(session_id, {
+            "type": "session_reconnected",
+            "reason": "gemini_refresh",
+        })
+        await _speak_to_student(
+            "[INTERNAL — connection refreshed, continue naturally] "
+            "Say one short sentence that you are still here and ready to continue. "
+            "Then ask your next interview question — do NOT give the closing report yet.",
+            force=True,
+        )
+
+    gemini._on_reconnected = _after_gemini_reconnect
 
     async def time_watchdog():
         """Wall-clock interview pacing — separate from FSM turn budgets.
@@ -852,6 +962,34 @@ async def run_interview_pipeline(
 
     time_watchdog_task = asyncio.create_task(time_watchdog())
 
+    async def pacing_watchdog():
+        """Inject fresh Gemini topics when turn consumption outpaces the 25-min target."""
+        try:
+            await participant_joined.wait()
+            while not ending:
+                await asyncio.sleep(180)
+                if ending or state.is_complete():
+                    continue
+                if state.get_interview_elapsed_seconds() >= MIN_INTERVIEW_SEC:
+                    continue
+                if not state.pacing_ahead_of_schedule():
+                    continue
+                if state.dynamic_injection_count >= 8:
+                    continue
+                logger.info(
+                    f"Pacing injection | session={session_id} "
+                    f"turns={state.total_turns} elapsed={state.get_interview_elapsed_seconds()}s"
+                )
+                state.extend_current_phase(extra_turns=4)
+                state.dynamic_injection_count += 1
+                injection = build_mid_interview_injection(state)
+                gemini._system_instruction = build_system_prompt(state)
+                await _speak_to_student(injection, force=True)
+        except asyncio.CancelledError:
+            return
+
+    pacing_watchdog_task = asyncio.create_task(pacing_watchdog())
+
     async def silence_recovery_watchdog():
         """If the student speaks but the AI goes silent (stuck pipeline),
         nudge Gemini to respond. Fixes 'Hello, are you there?' dead air."""
@@ -859,15 +997,14 @@ async def run_interview_pipeline(
         try:
             await participant_joined.wait()
             while not ending:
-                await asyncio.sleep(45)
+                await asyncio.sleep(25)
                 if ending or not participant_joined.is_set():
                     continue
                 idle_sec = time.time() - last_activity_at
-                if idle_sec < 75:
+                if idle_sec < 35:
                     continue
                 if bot_state["responding"]:
-                    # Stuck 'responding' flag — reset so pipeline can recover.
-                    if idle_sec > 120:
+                    if idle_sec > 75:
                         logger.warning(
                             f"Resetting stuck bot_state | session={session_id} "
                             f"idle={idle_sec:.0f}s"
@@ -876,15 +1013,25 @@ async def run_interview_pipeline(
                     continue
                 logger.warning(
                     f"Silence recovery — nudging AI | session={session_id} "
-                    f"idle={idle_sec:.0f}s"
+                    f"idle={idle_sec:.0f}s conn_age={gemini.connection_age_seconds():.0f}s"
                 )
                 last_activity_at = time.time()
+                conn_age = gemini.connection_age_seconds()
+                if conn_age >= 8.5 * 60 and idle_sec >= 50:
+                    logger.warning(
+                        f"Silence recovery — attempting Gemini reconnect | session={session_id}"
+                    )
+                    try:
+                        await gemini.reconnect_for_continuity()
+                        continue
+                    except Exception as e:
+                        logger.error(f"Silence recovery reconnect failed: {e}")
                 await _speak_to_student(
                     "[INTERNAL RECOVERY NOTE — candidate may be waiting] "
                     "The candidate may have said something or is waiting for you. "
-                    "Respond warmly right now. If you asked a question, rephrase it "
-                    "briefly. If they greeted you, greet them back and continue "
-                    "the interview with your next question.",
+                    "Respond warmly right now. If they asked you a question, answer it "
+                    "directly first. If you asked a question, rephrase it briefly. "
+                    "Never stay silent — continue the interview with your next question.",
                     force=True,
                 )
         except asyncio.CancelledError:
@@ -905,7 +1052,7 @@ async def run_interview_pipeline(
         await _end_interview(state, reason="error")
     finally:
         unregister_shutdown_handler(session_id)
-        for bg_task in (watchdog_task, time_watchdog_task, silence_recovery_task, disconnect_shutdown_task):
+        for bg_task in (watchdog_task, time_watchdog_task, pacing_watchdog_task, silence_recovery_task, disconnect_shutdown_task):
             if bg_task and not bg_task.done():
                 bg_task.cancel()
         remove_session_state(session_id)

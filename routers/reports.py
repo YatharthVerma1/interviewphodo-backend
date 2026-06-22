@@ -1,5 +1,7 @@
 from typing import Optional
 
+from loguru import logger
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from routers.auth import get_current_user
 from models.report import ReportResponse
@@ -7,9 +9,18 @@ from database.supabase_client import fetch_one, supabase_admin
 from services.progress_tracker import build_user_progress
 from services.progress_adapter import adapt_progress_for_frontend, build_sessions_by_round
 from services.report_enricher import enrich_report_from_session
+from services.report_generator import backfill_missing_reports, ensure_report_for_session
 from services.turn_scorer import build_turn_breakdown
 
 router = APIRouter()
+
+
+async def _safe_backfill(user_id: str, limit: int = 25) -> None:
+    """Backfill reports without failing the HTTP request if one session errors."""
+    try:
+        await backfill_missing_reports(user_id, limit=limit)
+    except Exception as e:
+        logger.error(f"Report backfill failed for user {user_id}: {e}")
 
 
 def _enrich_report_with_turns(report: dict, session_id: str) -> dict:
@@ -43,6 +54,8 @@ async def get_report(
     report = fetch_one(
         supabase_admin.table("reports").select("*").eq("session_id", session_id)
     )
+    if not report:
+        report = await ensure_report_for_session(session_id, current_user["id"])
     if not report:
         raise HTTPException(404, "Report not ready yet — session may still be completing")
 
@@ -80,13 +93,6 @@ async def my_progress(
     """
     Progress data for charts — score timeline, filler trend, WPM trend,
     per-phase averages, and skill heatmap buckets.
-
-    Frontend can plot:
-      - score_timeline  → line chart of overall score over sessions
-      - filler_timeline → line chart (lower is better)
-      - wpm_timeline    → line chart (ideal ~130-150)
-      - by_skill        → bar chart / radar chart
-      - by_company      → comparison cards
     """
     if company and company.lower() not in {
         "tcs", "infosys", "wipro", "hcl", "accenture",
@@ -94,6 +100,7 @@ async def my_progress(
     }:
         raise HTTPException(400, "Invalid company filter")
 
+    await _safe_backfill(current_user["id"])
     data = build_user_progress(current_user["id"], company=company)
     data["sessions_by_round"] = build_sessions_by_round(current_user["id"])
     return adapt_progress_for_frontend(data)
@@ -104,6 +111,7 @@ async def my_reports(
     current_user: dict = Depends(get_current_user),
     limit: int = 10,
 ):
+    await _safe_backfill(current_user["id"], limit=limit + 15)
     rows = supabase_admin.table("reports").select(
         "id, session_id, overall_score, phase_scores, filler_count, "
         "words_per_minute, pace_verdict, posture_score, created_at, turn_breakdown"

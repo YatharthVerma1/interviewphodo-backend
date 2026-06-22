@@ -11,6 +11,7 @@ from database.supabase_client import supabase_admin
 from models.user import UserProfile, UserUpdateRequest
 from prompts.role_pools import normalize_target_role, normalize_timeline
 from config import settings
+from services.credits import owner_profile_view
 
 LOCAL_UPLOAD_ROOT = Path(__file__).resolve().parent.parent / "uploads" / "resumes"
 
@@ -57,7 +58,7 @@ async def get_current_user(
 
 @router.get("/me", response_model=UserProfile)
 async def get_me(current_user: dict = Depends(get_current_user)):
-    return current_user
+    return owner_profile_view(current_user)
 
 
 @router.patch("/me")

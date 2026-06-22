@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     frontend_url: str = "http://localhost:3000"
     secret_key: str = "dev-secret-change-in-production"
     app_env: str = "development"
+    # Comma-separated owner emails — unlimited sessions, no credit deduction (.env only)
+    owner_emails: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -57,6 +59,19 @@ class Settings(BaseSettings):
         return self._is_configured(self.razorpay_key_id) and self._is_configured(
             self.razorpay_key_secret
         )
+
+    @property
+    def owner_email_set(self) -> frozenset[str]:
+        return frozenset(
+            part.strip().lower()
+            for part in self.owner_emails.split(",")
+            if part.strip()
+        )
+
+    def is_owner_email(self, email: str | None) -> bool:
+        if not email or not self.owner_email_set:
+            return False
+        return email.strip().lower() in self.owner_email_set
 
 
 settings = Settings()

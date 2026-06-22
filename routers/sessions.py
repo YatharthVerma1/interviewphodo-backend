@@ -8,10 +8,13 @@ from routers.auth import get_current_user
 from models.session import SessionStartRequest, SessionResponse, PostureEventRequest
 from services.daily_service import create_interview_room
 from services.interview_pipeline import request_pipeline_shutdown, run_interview_pipeline
+from services.report_generator import ensure_report_for_session
 from services.interview_fsm import get_session_state
+from prompts.companies import VALID_COMPANIES
 from prompts.role_pools import normalize_target_role
 from database.supabase_client import fetch_one, supabase_admin
 from config import settings
+from services.credits import has_sessions_remaining
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -82,10 +85,10 @@ async def start_session(
     )
     if not ud:
         raise HTTPException(404, "User profile not found")
-    if ud["sessions_used"] >= ud["sessions_limit"]:
+    if not has_sessions_remaining(ud, current_user.get("email")):
         raise HTTPException(
             402,
-            "No sessions remaining. Purchase a pack at interviewphodo.com/pricing"
+            "No sessions remaining. Purchase a pack at interviewphodo.com/pricing",
         )
 
     # Create Daily.co room
@@ -207,11 +210,13 @@ async def end_session(
     if row["user_id"] != current_user["id"]:
         raise HTTPException(403, "Not authorized")
 
-    await request_pipeline_shutdown(session_id, reason="manual_end")
-
-    supabase_admin.table("sessions").update({
-        "status": "abandoned", "ended_at": "now()"
-    }).eq("id", session_id).execute()
+    ended = await request_pipeline_shutdown(session_id, reason="manual_end")
+    if not ended:
+        await ensure_report_for_session(session_id, current_user["id"])
+        supabase_admin.table("sessions").update({
+            "status": "abandoned",
+            "ended_at": "now()",
+        }).eq("id", session_id).execute()
 
     return {"status": "ended", "session_id": session_id}
 
