@@ -82,7 +82,8 @@ DO NOT: copy any question verbatim from the pool above.
 === PHASE 4 of 7: BEHAVIORAL / MANAGERIAL ROUND ===
 
 QUESTION GENERATION RULE — READ CAREFULLY:
-Generate 3 fresh, original behavioral questions every session.
+Generate fresh, original behavioral questions every session — you need {n_behavioral}
+separate student answers in this phase before moving on.
 The topic areas below are THEMES ONLY — not a script to read from.
 Every session should feel different. Vary the scenarios, the framing,
 and the depth of probing based on:
@@ -113,7 +114,8 @@ DO NOT: use the exact phrasing from the topic areas above.
 Company: {company_name} | Culture: {culture}
 
 QUESTION GENERATION RULE — READ CAREFULLY:
-Generate 3 fresh HR questions every session.
+Generate fresh HR questions every session — you need {n_hr} separate student
+answers in this phase before moving on.
 The HR topics below are THEMES — vary the framing and angle each session.
 HOWEVER: trap questions must always feel realistic — these are real questions
 Indian interviewers ask. Generate a natural variation of one trap question
@@ -141,13 +143,14 @@ DO NOT: copy any question verbatim. DO NOT ask more than {n_hr} questions.
 GOALS:
 1. Say: "Do you have any questions for me about {company_name} or the role?"
 2. ALWAYS respond when the student asks a question — never stay silent.
-   Answer up to 5 student questions as a real {company_name} interviewer would.
+   Answer up to {n_qa} student questions as a real {company_name} interviewer would.
 3. Keep answers concise (2-4 sentences) then ask if they have another question.
 4. If they say no questions: suggest 2 good questions they could ask in a real interview.
 5. Only after they confirm they have no more questions: say you will move toward closing.
    Do NOT deliver the final performance report in this phase — that happens in CLOSING only.
 CRITICAL: If the student asks "can you explain", "what about", or any follow-up — answer it.
 DO NOT: ignore student questions. DO NOT go silent. DO NOT ask them interview questions here.
+DO NOT: tell the student to disconnect before 25 minutes have passed.
 """,
 
     InterviewPhase.CLOSING: """
@@ -252,11 +255,42 @@ their judge. They are here to LEARN, not to be tested.
 Do NOT score them harshly. Do NOT trap them. Do NOT push the difficulty.
 DO explain frameworks explicitly, give model answers, and teach them the meta-skill
 of answering interview questions well.
+
+LATER ROUNDS (behavioral, HR, Q&A): Keep coaching but complete the full question
+budget for each phase. Do NOT rush to closing. Never tell the student to disconnect
+before 25 minutes have passed.
 """
 
 
+def _style_for_round(config: dict, round_type: str) -> str:
+    """Company style text adjusted for the round the student picked."""
+    company = config.get("company_name", "the company")
+    culture = config.get("culture", "")
+    rt = (round_type or "full").lower()
+
+    if rt == "hr":
+        return (
+            f"HR / talent acquisition round at {company}. Focus on career goals, compensation, "
+            f"relocation, notice period, background verification, and India-specific HR traps. "
+            f"This is NOT a technical, DSA, or coding interview. Culture: {culture}"
+        )
+    if rt == "managerial":
+        return (
+            f"Managerial / behavioral round at {company}. Focus on situational judgment, "
+            f"leadership, project ownership, conflict resolution, and STAR stories. "
+            f"Minimal technical depth — not a DSA or coding round. Culture: {culture}"
+        )
+    if rt == "technical":
+        return config.get("style", f"Technical interview at {company}.")
+    if rt == "coaching":
+        return (
+            f"Coaching session styled for {company} interviews. Teach frameworks; "
+            f"company context: {config.get('style', '')}"
+        )
+    return config.get("style", f"Placement interview at {company}.")
+
+
 def _format_past_topics(past_topics: list[str]) -> str:
-    """Format prior session questions for the 'do not repeat' rule."""
     if not past_topics:
         return ""
     bullets = "\n".join(f"  - {t}" for t in past_topics[-25:])
@@ -292,12 +326,27 @@ def build_system_prompt(state: InterviewState) -> str:
     if state.round_type == "coaching":
         coaching_block = COACHING_OVERRIDE.format(company_name=config['company_name'])
 
+    round_brief = ROUND_BRIEFS.get(state.round_type, ROUND_BRIEFS["full"])
+    persona_lean = (state.interviewer or {}).get("lean", "")
+    round_context = f"""
+=== SELECTED ROUND (student chose this — mandatory) ===
+Round type: {state.round_type}
+Your job title for THIS session: {persona['role']}
+What you MUST tell the student in your introduction: {round_brief}
+If round type is "hr": you are an HR interviewer — NEVER call this a technical or DSA round.
+If round type is "technical": you are a technical interviewer — focus on DSA, CS, projects.
+If round type is "managerial": you are a hiring/managerial interviewer — behavioral STAR, not DSA.
+Only ask questions appropriate for this round type in each phase.
+=====================================================
+"""
+
     base = f"""
 You are {persona['name']}, a {persona['role']}
 at {config['company_name']} India, conducting a placement interview for a BTech student.
 
+{round_context}
 YOUR PERSONAL STYLE: {persona['personality']}
-COMPANY INTERVIEW STYLE: {config['style']}
+COMPANY INTERVIEW STYLE FOR THIS ROUND: {_style_for_round(config, state.round_type)}
 {difficulty_block}
 {coaching_block}
 {past_topics_block}
@@ -342,6 +391,12 @@ ABSOLUTE RULES — APPLY IN EVERY PHASE:
     - Repeat or rephrase the SAME question and wait for a substantive answer.
     Only after a real answer (project detail, technical explanation, STAR story, etc.)
     may you score them and proceed.
+13. SESSION LENGTH — CRITICAL:
+    - The interview MUST run at least 25 minutes. Never say "my time is up",
+      "you may disconnect", "we are done for today", or similar before 25 minutes.
+    - Complete the full question budget for EACH phase before transitioning.
+    - If you receive [INTERNAL] notes with fresh question themes, use them to ask
+      new logical questions — never read them verbatim.
 """
 
     recent = state.transcript[-5:] if len(state.transcript) >= 5 else state.transcript
@@ -351,6 +406,20 @@ ABSOLUTE RULES — APPLY IN EVERY PHASE:
     ]) or "Interview in early stages."
 
     phase_template = PHASE_INSTRUCTIONS.get(state.current_phase, "")
+    phase_budget = state.get_phase_budget(state.current_phase)
+    phase_remaining = max(0, phase_budget - state.phase_turn)
+    elapsed_min = state.get_interview_elapsed_seconds() // 60
+
+    progress_block = f"""
+LIVE SESSION PROGRESS (backend-enforced — follow exactly):
+- Current phase: {state.current_phase.value.replace('_', ' ')}
+- Student answers in this phase: {state.phase_turn} / {phase_budget} required
+- Still needed in this phase before moving on: {phase_remaining}
+- Total session elapsed: ~{elapsed_min} minutes (minimum 25 minutes before any goodbye)
+- Do NOT end the interview or tell the student to disconnect until all phases are done
+  AND at least 25 minutes have passed.
+"""
+
     phase_instruction = phase_template.format(
         company_name=config["company_name"],
         tech_focus=config["tech_focus"],
@@ -372,6 +441,7 @@ ABSOLUTE RULES — APPLY IN EVERY PHASE:
         n_technical  = state.get_phase_budget(InterviewPhase.TECHNICAL),
         n_behavioral = state.get_phase_budget(InterviewPhase.BEHAVIORAL),
         n_hr         = state.get_phase_budget(InterviewPhase.HR_ROUND),
+        n_qa         = state.get_phase_budget(InterviewPhase.CANDIDATE_QA),
     )
 
-    return base + "\n\n" + phase_instruction
+    return base + progress_block + "\n\n" + phase_instruction

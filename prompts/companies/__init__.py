@@ -34,95 +34,143 @@ COMPANY_CONFIGS = {
 
 VALID_COMPANIES = list(COMPANY_CONFIGS.keys())
 
-# Interviewer roster — 3 distinct personas per company.
-# Each persona has a `personality` line that shapes Gemini's tone via the
-# system prompt, so one TCS interview feels methodical, the next feels
-# direct, the next feels conversational.
+# Interviewer roster — distinct personas per company.
+# `lean` controls which round types each persona may run (see pick_interviewer_for_round):
+#   hr          → HR round (Round 6)
+#   technical   → Technical round (Round 2-3)
+#   managerial  → Managerial / behavioral round (Round 5)
 INTERVIEWER_ROSTER: dict[str, list[dict]] = {
     "tcs": [
-        {"name": "Ramesh Iyer",       "role": "Senior HR Manager",
+        {"name": "Ramesh Iyer",        "role": "Senior HR Manager",
+         "lean": "hr",
          "personality": "calm, methodical, asks questions slowly and listens carefully"},
-        {"name": "Priya Sharma",      "role": "Talent Acquisition Lead",
+        {"name": "Priya Sharma",       "role": "Talent Acquisition Lead",
+         "lean": "hr",
          "personality": "warm and conversational, but probes deeply when answers feel rehearsed"},
-        {"name": "Vikram Subramanian","role": "Engagement Manager",
+        {"name": "Vikram Subramanian", "role": "Engagement Manager",
+         "lean": "managerial",
          "personality": "direct and no-nonsense, expects crisp answers, dislikes filler talk"},
+        {"name": "Karthik Menon",      "role": "Technical Lead — Campus Hiring",
+         "lean": "technical",
+         "personality": "structured technical interviewer — DSA, core CS, and project depth; not an HR round"},
     ],
     "infosys": [
-        {"name": "Priya Sharma",      "role": "Talent Acquisition Lead",
-         "personality": "structured and process-oriented, follows a textbook interview style"},
-        {"name": "Karthik Raghavan",  "role": "Senior Technical Recruiter",
-         "personality": "analytical and patient, likes step-by-step thinking"},
-        {"name": "Anjali Verma",      "role": "Campus Hiring Manager",
-         "personality": "friendly but thorough, likes to discuss real college projects in depth"},
+        {"name": "Priya Sharma",       "role": "Talent Acquisition Lead",
+         "lean": "hr",
+         "personality": "structured and process-oriented, follows a textbook HR interview style"},
+        {"name": "Karthik Raghavan",   "role": "Senior Technical Recruiter",
+         "lean": "hr",
+         "personality": "HR-facing recruiter who runs Round 6 — salary, bond, career goals; not a coding interviewer"},
+        {"name": "Anjali Verma",       "role": "Campus Hiring Manager",
+         "lean": "managerial",
+         "personality": "friendly but thorough, situational and behavioral focus, likes real college project stories"},
+        {"name": "Rohan Das",          "role": "Senior Technical Interviewer",
+         "lean": "technical",
+         "personality": "analytical and patient, expects step-by-step technical explanations"},
     ],
     "wipro": [
-        {"name": "Anjali Nair",       "role": "HR Business Partner",
+        {"name": "Anjali Nair",        "role": "HR Business Partner",
+         "lean": "hr",
          "personality": "warm and people-focused, values communication clarity over technical depth"},
-        {"name": "Suresh Reddy",      "role": "Technical Lead - Hiring",
+        {"name": "Suresh Reddy",       "role": "Technical Lead — Hiring",
+         "lean": "technical",
          "personality": "practical and grounded, asks how things work in real production scenarios"},
-        {"name": "Meena Pillai",      "role": "Senior Recruiter",
-         "personality": "energetic and curious, asks lots of follow-up questions"},
+        {"name": "Meena Pillai",       "role": "Senior Recruiter",
+         "lean": "hr",
+         "personality": "energetic HR interviewer, covers CTC, relocation, and India-specific traps"},
+        {"name": "Rajesh Nambiar",     "role": "Delivery Manager",
+         "lean": "managerial",
+         "personality": "outcome-focused managerial interviewer, STAR behavioral and leadership scenarios"},
     ],
     "hcl": [
-        {"name": "Suresh Menon",      "role": "Technical Recruitment Manager",
-         "personality": "straight-talking and pragmatic, focuses on what you can ACTUALLY build"},
-        {"name": "Divya Krishnan",    "role": "HR Lead - Engineering",
-         "personality": "supportive and coaching, helps the candidate frame answers better"},
-        {"name": "Arvind Kumar",      "role": "Engineering Manager",
-         "personality": "skeptical by default, will challenge weak claims on the resume"},
+        {"name": "Suresh Menon",       "role": "Technical Recruitment Manager",
+         "lean": "technical",
+         "personality": "straight-talking technical interviewer, focuses on what you can ACTUALLY build"},
+        {"name": "Divya Krishnan",     "role": "HR Lead — Engineering",
+         "lean": "hr",
+         "personality": "supportive HR interviewer, career goals, compensation, and background checks"},
+        {"name": "Arvind Kumar",       "role": "Engineering Manager",
+         "lean": "managerial",
+         "personality": "skeptical hiring manager, challenges weak resume claims with situational questions"},
+        {"name": "Neha Gupta",         "role": "Senior Software Engineer — Interviewer",
+         "lean": "technical",
+         "personality": "deep technical probes on DSA, systems, and project implementation"},
     ],
     "accenture": [
-        {"name": "Meera Krishnan",    "role": "Campus Recruiting Lead",
-         "personality": "polished and professional, expects business-like communication"},
-        {"name": "Rohan Desai",       "role": "Technical Architect",
-         "personality": "intellectual and precise, dislikes vague answers"},
-        {"name": "Sneha Patel",       "role": "Senior HR Partner",
-         "personality": "high-energy and friendly, makes the candidate feel comfortable but probes hard"},
+        {"name": "Meera Krishnan",     "role": "Campus Recruiting Lead",
+         "lean": "hr",
+         "personality": "polished HR interviewer, expects business-like communication on career and fit"},
+        {"name": "Rohan Desai",        "role": "Technical Architect",
+         "lean": "technical",
+         "personality": "intellectual and precise technical interviewer, dislikes vague answers"},
+        {"name": "Sneha Patel",        "role": "Senior HR Partner",
+         "lean": "hr",
+         "personality": "high-energy HR round, makes candidate comfortable but probes hard on motivation"},
+        {"name": "Amit Shah",          "role": "Associate Manager — Hiring",
+         "lean": "managerial",
+         "personality": "managerial round focus — consulting scenarios, teamwork, client handling"},
     ],
     "cognizant": [
-        {"name": "Deepak Pillai",     "role": "Technical HR Manager",
-         "personality": "balanced and measured, evaluates both technical and soft skills equally"},
-        {"name": "Lakshmi Iyer",      "role": "Senior Talent Acquisition",
-         "personality": "thoughtful and observational, picks up on body language cues"},
-        {"name": "Manoj Bhat",        "role": "Delivery Manager",
-         "personality": "outcome-focused, wants concrete examples of what you delivered"},
+        {"name": "Deepak Pillai",      "role": "Technical HR Manager",
+         "lean": "hr",
+         "personality": "HR round specialist — evaluates motivation and fit, not DSA or coding"},
+        {"name": "Lakshmi Iyer",       "role": "Senior Talent Acquisition",
+         "lean": "hr",
+         "personality": "thoughtful HR interviewer, relocation, CTC, and notice-period traps"},
+        {"name": "Manoj Bhat",         "role": "Delivery Manager",
+         "lean": "managerial",
+         "personality": "managerial interviewer, wants concrete delivery and ownership examples"},
+        {"name": "Sanjay Rao",         "role": "Technical Lead — Engineering",
+         "lean": "technical",
+         "personality": "balanced technical depth — verbal DSA, core CS, and project walkthroughs"},
     ],
     "tech_mahindra": [
-        {"name": "Vikram Rao",        "role": "Talent Acquisition Specialist",
-         "personality": "casual and friendly, likes natural conversation"},
-        {"name": "Pooja Deshmukh",    "role": "Technical HR",
-         "personality": "structured and checklist-driven, covers each topic systematically"},
-        {"name": "Sanjay Kulkarni",   "role": "Practice Lead",
-         "personality": "curious about real-world thinking, asks 'how would you handle X' a lot"},
+        {"name": "Vikram Rao",         "role": "Talent Acquisition Specialist",
+         "lean": "hr",
+         "personality": "casual HR interviewer, natural conversation on career and compensation"},
+        {"name": "Pooja Deshmukh",     "role": "Technical HR",
+         "lean": "hr",
+         "personality": "structured HR round, checklist on bond, location, and long-term fit"},
+        {"name": "Sanjay Kulkarni",    "role": "Practice Lead",
+         "lean": "technical",
+         "personality": "technical interviewer, real-world problem solving and system thinking"},
+        {"name": "Meera Joshi",        "role": "Senior Manager — Campus Hiring",
+         "lean": "managerial",
+         "personality": "managerial round, leadership stories and conflict-resolution scenarios"},
     ],
     "zoho": [
-        {"name": "Anand Krishnan",    "role": "Senior Engineer and Interviewer",
+        {"name": "Anand Krishnan",     "role": "Senior Engineer and Interviewer",
+         "lean": "technical",
          "personality": "deeply technical, expects original thinking, dislikes textbook answers"},
-        {"name": "Lakshmi Narayanan", "role": "Engineering Lead",
-         "personality": "patient and Socratic, will guide the student through hard problems with hints"},
-        {"name": "Rajesh Pandian",    "role": "Senior Software Engineer",
-         "personality": "blunt and tough, raises the bar quickly when student answers well"},
+        {"name": "Lakshmi Narayanan",  "role": "Engineering Lead",
+         "lean": "technical",
+         "personality": "patient technical interviewer, Socratic hints on hard problems"},
+        {"name": "Rajesh Pandian",     "role": "Senior Software Engineer",
+         "lean": "technical",
+         "personality": "tough technical bar, raises difficulty when student answers well"},
+        {"name": "Priya Venkatesh",    "role": "Senior HR Manager — Campus Hiring",
+         "lean": "hr",
+         "personality": "warm HR interviewer — CTC, bond, relocation, motivation; never runs DSA rounds"},
+        {"name": "Vikram Iyer",        "role": "Engineering Manager",
+         "lean": "managerial",
+         "personality": "managerial round — product ownership, depth vs breadth, team fit at Zoho"},
     ],
 }
 
 
 def get_company_config(company_id: str) -> dict:
+    from .pool_extensions import merge_pool_extensions
+
     config = COMPANY_CONFIGS.get(company_id.lower())
     if not config:
         raise ValueError(
             f"Unknown company '{company_id}'. Valid options: {VALID_COMPANIES}"
         )
-    return config
+    return merge_pool_extensions(config)
 
 
 def pick_interviewer(company_id: str, seed: Optional[str] = None) -> dict:
-    """Pick one interviewer persona for this session.
-
-    `seed` should be the session_id (or anything stable per session). Same
-    seed → same persona for the whole interview. Different sessions → likely
-    different persona, so the SAME company feels like a different person
-    across attempts.
-    """
+    """Pick one interviewer persona for this session (random from roster)."""
     roster = INTERVIEWER_ROSTER.get(company_id.lower())
     if not roster:
         # Fall back to whatever the company config has hard-coded
@@ -136,26 +184,123 @@ def pick_interviewer(company_id: str, seed: Optional[str] = None) -> dict:
     return rng.choice(roster)
 
 
-# Heuristic role tags — used when assembling a multi-persona panel so we can
-# pick a "technical-leaning" person for the TECHNICAL phase and an
-# "HR/manager-leaning" person for the HR phase. Falls back to round-robin
-# if the heuristics don't match.
+# Persona classification — explicit `lean` on roster entries is authoritative.
 _ROLE_KEYWORDS_TECHNICAL = (
-    "engineer", "tech lead", "tech ", "engineering", "architect",
-    "delivery", "practice lead", "manager - hiring",
+    "senior engineer", "software engineer", "engineering lead", "technical lead",
+    "technical architect", "tech lead", "sde",
 )
 _ROLE_KEYWORDS_HR = (
-    "hr", "talent", "recruit", "campus", "people", "partner",
+    "hr", "human resources", "talent acquisition", "recruiter", "recruiting",
+    "campus hiring", "people partner", "business partner",
 )
+_ROLE_KEYWORDS_MANAGERIAL = (
+    "engagement manager", "delivery manager", "engineering manager",
+    "hiring manager", "practice lead", "associate manager",
+)
+
+
+def _persona_lean(persona: dict) -> str:
+    explicit = (persona.get("lean") or "").lower().strip()
+    if explicit in ("hr", "technical", "managerial"):
+        return explicit
+    return _role_lean_from_title(persona.get("role", ""))
+
+
+def _role_lean_from_title(role: str) -> str:
+    r = role.lower()
+    if any(kw in r for kw in _ROLE_KEYWORDS_HR):
+        return "hr"
+    if any(kw in r for kw in _ROLE_KEYWORDS_TECHNICAL):
+        return "technical"
+    if any(kw in r for kw in _ROLE_KEYWORDS_MANAGERIAL):
+        return "managerial"
+    return "mixed"
 
 
 def _role_lean(role: str) -> str:
-    r = role.lower()
-    if any(kw in r for kw in _ROLE_KEYWORDS_TECHNICAL):
-        return "technical"
-    if any(kw in r for kw in _ROLE_KEYWORDS_HR):
-        return "hr"
-    return "mixed"
+    """Backward-compat wrapper for title-only classification."""
+    return _role_lean_from_title(role)
+
+
+def _synthetic_technical_persona(company_id: str, seed: Optional[str] = None) -> dict:
+    cfg = get_company_config(company_id)
+    rng = random.Random(f"{seed}:tech" if seed else None)
+    names = ["Karthik Menon", "Rohan Das", "Suresh Reddy", "Anand Krishnan", "Neha Gupta"]
+    return {
+        "name": rng.choice(names),
+        "role": f"Technical Interviewer — {cfg['company_name']} Engineering",
+        "lean": "technical",
+        "personality": (
+            "technical round interviewer — verbal DSA, core CS, system thinking, and deep "
+            "project probes. Does NOT conduct HR or salary discussions."
+        ),
+    }
+
+
+def _synthetic_hr_persona(company_id: str, seed: Optional[str] = None) -> dict:
+    cfg = get_company_config(company_id)
+    rng = random.Random(f"{seed}:hr" if seed else None)
+    names = ["Priya Venkatesh", "Meera Shah", "Kavitha Reddy", "Ananya Iyer"]
+    return {
+        "name": rng.choice(names),
+        "role": f"HR Manager — {cfg['company_name']} Campus Hiring",
+        "lean": "hr",
+        "personality": (
+            "professional HR interviewer for Round 6 — career goals, CTC, bond, relocation, "
+            "notice period, and India-specific trap questions. Does NOT conduct technical, DSA, "
+            "or coding interviews."
+        ),
+    }
+
+
+def _synthetic_managerial_persona(company_id: str, seed: Optional[str] = None) -> dict:
+    cfg = get_company_config(company_id)
+    rng = random.Random(f"{seed}:mgr" if seed else None)
+    names = ["Vikram Menon", "Sanjay Kulkarni", "Arun Mehta", "Deepa Nair"]
+    return {
+        "name": rng.choice(names),
+        "role": f"Hiring Manager — {cfg['company_name']}",
+        "lean": "managerial",
+        "personality": (
+            "managerial round interviewer — situational judgment, leadership, project ownership, "
+            "STAR behavioral stories. Minimal technical depth; not a DSA or coding round."
+        ),
+    }
+
+
+_ROUND_TO_LEAN = {
+    "hr": "hr",
+    "technical": "technical",
+    "managerial": "managerial",
+}
+
+
+def pick_interviewer_for_round(
+    company_id: str,
+    round_type: str,
+    seed: Optional[str] = None,
+) -> dict:
+    """Pick a persona that matches the round the student selected."""
+    rt = (round_type or "full").lower().strip()
+    if rt == "mixed":
+        rt = "full"
+
+    roster = INTERVIEWER_ROSTER.get(company_id.lower(), [])
+    rng = random.Random(seed) if seed else random
+
+    target_lean = _ROUND_TO_LEAN.get(rt)
+    if target_lean:
+        pool = [p for p in roster if _persona_lean(p) == target_lean]
+        if pool:
+            return rng.choice(pool)
+        if target_lean == "hr":
+            return _synthetic_hr_persona(company_id, seed)
+        if target_lean == "technical":
+            return _synthetic_technical_persona(company_id, seed)
+        if target_lean == "managerial":
+            return _synthetic_managerial_persona(company_id, seed)
+
+    return pick_interviewer(company_id, seed)
 
 
 def pick_multi_personas(company_id: str, seed: Optional[str] = None) -> dict:
@@ -182,22 +327,23 @@ def pick_multi_personas(company_id: str, seed: Optional[str] = None) -> dict:
     pool = list(roster)
     rng.shuffle(pool)
 
-    by_lean: dict[str, list[dict]] = {"technical": [], "hr": [], "mixed": []}
+    by_lean: dict[str, list[dict]] = {"technical": [], "hr": [], "managerial": [], "mixed": []}
     for p in pool:
-        by_lean[_role_lean(p.get("role", ""))].append(p)
+        lean = _persona_lean(p)
+        bucket = lean if lean in by_lean else "mixed"
+        by_lean[bucket].append(p)
 
     def _pop(category: str) -> Optional[dict]:
         if by_lean[category]:
             return by_lean[category].pop(0)
-        # Fallback: borrow from another category
-        for fallback in ("mixed", "technical", "hr"):
+        for fallback in ("mixed", "managerial", "technical", "hr"):
             if by_lean[fallback]:
                 return by_lean[fallback].pop(0)
         return None
 
-    technical = _pop("technical") or pool[0]
-    hr        = _pop("hr")        or pool[-1]
-    warmup    = _pop("mixed")     or _pop("technical") or _pop("hr") or pool[0]
+    technical = _pop("technical") or _synthetic_technical_persona(company_id, seed)
+    hr        = _pop("hr")        or _synthetic_hr_persona(company_id, seed)
+    warmup    = _pop("managerial") or _pop("mixed") or _pop("hr") or technical
 
     return {"warmup": warmup, "technical": technical, "hr": hr}
 

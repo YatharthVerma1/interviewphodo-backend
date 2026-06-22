@@ -17,13 +17,13 @@ from services.credits import is_owner_user
 # ---------------------------------------------------------------------------
 # Daily global-context guard.
 #
-# daily-python's native context (Daily.init/Daily.deinit) is a PROCESS-WIDE
-# singleton. Calling Daily.deinit() while ANOTHER session is still using the
-# context crashes the whole process with a non-unwinding Rust panic
-# (exit 134). That happens whenever two interviews end close together.
+# Pipecat's DailyTransport calls Daily.init() once per process (class flag
+# `_daily_initialized` on DailyTransportClient). We must NEVER call
+# Daily.deinit() ourselves — that destroys the native context while Pipecat
+# still believes init already ran, so the next interview crashes (Rust panic).
 #
-# We reference-count live pipelines and only deinit when the LAST one ends.
-# The lock serialises the increment/decrement + deinit decision.
+# We only reference-count live pipelines so two sessions ending together never
+# race on teardown logic.
 # ---------------------------------------------------------------------------
 _active_pipeline_count = 0
 _daily_lock = asyncio.Lock()
@@ -82,6 +82,7 @@ def _extract_latest_student_text(context) -> str:
 
 
 async def _register_pipeline_start():
+    """Increment live pipeline count (Daily.init is owned by Pipecat)."""
     global _active_pipeline_count
     async with _daily_lock:
         _active_pipeline_count += 1
@@ -89,21 +90,14 @@ async def _register_pipeline_start():
 
 
 async def _register_pipeline_end():
-    """Decrement the live-pipeline count; deinit Daily only when it hits 0."""
+    """Decrement live pipeline count — do NOT call Daily.deinit()."""
     global _active_pipeline_count
     async with _daily_lock:
         _active_pipeline_count = max(0, _active_pipeline_count - 1)
         logger.debug(f"Active pipelines: {_active_pipeline_count}")
-        if _active_pipeline_count == 0:
-            try:
-                from daily import Daily
-                Daily.deinit()
-                logger.debug("Daily.deinit() — no active pipelines remain")
-            except Exception as cleanup_err:
-                logger.debug(f"Daily.deinit cleanup skipped: {cleanup_err}")
 from prompts.companies import (
     build_personas_by_phase,
-    pick_interviewer,
+    pick_interviewer_for_round,
     pick_multi_personas,
 )
 from prompts.fsm_prompt_builder import build_system_prompt
@@ -258,6 +252,8 @@ async def run_interview_pipeline(
             LLMRunFrame,
             TranscriptionFrame,
             TTSTextFrame,
+            BotStartedSpeakingFrame,
+            BotStoppedSpeakingFrame,
         )
         from pipecat.pipeline.pipeline import Pipeline
         from pipecat.pipeline.runner import PipelineRunner
@@ -268,6 +264,7 @@ async def run_interview_pipeline(
             LLMUserAggregatorParams,
         )
         from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+        from pipecat.turns.user_mute.always_user_mute_strategy import AlwaysUserMuteStrategy
         from pipecat.services.google.gemini_live.llm import GeminiModalities
         from services.gemini_interview_llm import (
             GEMINI_LIVE_MODEL,
@@ -304,13 +301,20 @@ async def run_interview_pipeline(
             self.task = None
             self._last_user_text = ""
             self._ai_text_parts: list[str] = []
+            self._turn_complete_lock = asyncio.Lock()
 
         async def _on_turn_complete(self):
+            async with self._turn_complete_lock:
+                await self._process_turn_complete()
+
+        async def _process_turn_complete(self):
             nonlocal last_activity_at
             last_activity_at = time.time()
             ai_text = " ".join(self._ai_text_parts).strip()
             self._ai_text_parts = []
-            self.bot_state["responding"] = False
+            if not ai_text:
+                ai_text = (getattr(self.gemini, "_last_turn_spoken_text", "") or "").strip()
+            self.gemini._last_turn_spoken_text = ""
 
             # Primary: captured when Pipecat user aggregator finishes a turn.
             student_text = self.student_speech.get("pending", "").strip()
@@ -421,6 +425,14 @@ async def run_interview_pipeline(
                 "phase": self.state.current_phase.value,
             })
 
+            await broadcast(self.session_id, {
+                "type": "phase_sync",
+                "phase": self.state.current_phase.value,
+                "phase_turn": self.state.phase_turn,
+                "phase_budget": self.state.get_phase_budget(),
+                "turn": self.state.total_turns,
+            })
+
             if fillers:
                 await broadcast(self.session_id, {
                     "type": "filler_alert",
@@ -428,16 +440,22 @@ async def run_interview_pipeline(
                     "total_count": self.state.filler_count,
                 })
 
+            milestone = self.state.mid_inject_milestone()
+            if milestone and substantive:
+                self.state.mark_mid_injected(milestone)
+                self.state.dynamic_injection_count += 1
+                self.gemini._system_instruction = build_system_prompt(self.state)
+                injection = await build_mid_interview_injection(self.state)
+                await _speak_to_student(injection)
+
             if self.state.should_advance():
                 advanced = self.state.advance_phase()
                 if not advanced and self.state.should_block_closing():
                     self.state.extend_current_phase(extra_turns=6)
-                    injection = build_mid_interview_injection(self.state)
-                    self.state.dynamic_injection_count += 1
                     self.gemini._system_instruction = build_system_prompt(self.state)
-                    await _speak_to_student(injection, force=True)
                 elif advanced:
                     logger.info(f"Phase → {self.state.current_phase.value}")
+                    self.state.extend_later_phases_if_early()
 
                     # Multi-persona round: if the new phase is owned by a different
                     # persona, swap state.interviewer and announce the handoff so
@@ -475,10 +493,7 @@ async def run_interview_pipeline(
 
             elif self.state.pacing_ahead_of_schedule() and not self.state.should_block_closing():
                 self.state.extend_current_phase(extra_turns=4)
-                injection = build_mid_interview_injection(self.state)
-                self.state.dynamic_injection_count += 1
                 self.gemini._system_instruction = build_system_prompt(self.state)
-                await _speak_to_student(injection, force=True)
 
             if self.state.total_turns % 3 == 0:
                 await _sync_state_to_db(self.state)
@@ -516,7 +531,15 @@ async def run_interview_pipeline(
 
         async def process_frame(self, frame, direction: FrameDirection):
             await super().process_frame(frame, direction)
-            if isinstance(frame, LLMFullResponseStartFrame):
+
+            if isinstance(frame, BotStartedSpeakingFrame):
+                self.bot_state["responding"] = True
+                self.gemini.set_bot_audio_playing(True)
+            elif isinstance(frame, BotStoppedSpeakingFrame):
+                self.bot_state["responding"] = False
+                self.gemini.set_bot_audio_playing(False)
+                asyncio.create_task(_flush_pending_controls())
+            elif isinstance(frame, LLMFullResponseStartFrame):
                 self.bot_state["responding"] = True
             elif isinstance(frame, TranscriptionFrame) and frame.text:
                 chunk = frame.text.strip()
@@ -524,13 +547,11 @@ async def run_interview_pipeline(
                     self._last_user_text = f"{self._last_user_text} {chunk}".strip()
             elif isinstance(frame, TTSTextFrame) and frame.text:
                 self._ai_text_parts.append(frame.text)
-                await broadcast(self.session_id, {
-                    "type": "ai_text_delta",
-                    "text": frame.text,
-                    "phase": self.state.current_phase.value,
-                })
             elif isinstance(frame, LLMFullResponseEndFrame):
-                await self._on_turn_complete()
+                await self.push_frame(frame, direction)
+                asyncio.create_task(self._on_turn_complete())
+                return
+
             await self.push_frame(frame, direction)
 
     logger.info(f"Pipeline start | session={session_id} company={company} round={round_type}")
@@ -568,8 +589,11 @@ async def run_interview_pipeline(
             f"technical={panel['technical']['name']}, hr={panel['hr']['name']}"
         )
     else:
-        persona = pick_interviewer(company, seed=session_id)
-        logger.info(f"Persona={persona['name']} ({persona['role']})")
+        persona = pick_interviewer_for_round(company, round_type, seed=session_id)
+        logger.info(
+            f"Persona={persona['name']} ({persona['role']}) "
+            f"lean={persona.get('lean', '?')} for round={round_type}"
+        )
 
     logger.info(
         f"Session start | prior_completed={completed_count} → difficulty={difficulty} | "
@@ -599,21 +623,35 @@ async def run_interview_pipeline(
 
     initial_prompt = build_system_prompt(state)
 
-    transport = DailyTransport(
-        room_url,
-        room_token,
-        "InterviewPhodo AI",
-        DailyParams(
-            audio_in_enabled=True,
-            audio_out_enabled=True,
-            audio_in_sample_rate=16000,
-            audio_out_sample_rate=24000,
-            camera_out_enabled=False,
-            # stop_secs: wait ~2s of silence before ending the student's turn so
-            # they can think mid-answer without the AI jumping in immediately.
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=2.0)),
-        ),
-    )
+    # Pipecat DailyTransport calls Daily.init() on first use — we only track count.
+    await _register_pipeline_start()
+
+    try:
+        transport = DailyTransport(
+            room_url,
+            room_token,
+            "InterviewPhodo AI",
+            DailyParams(
+                audio_in_enabled=True,
+                audio_out_enabled=True,
+                audio_in_sample_rate=16000,
+                audio_out_sample_rate=24000,
+                camera_out_enabled=False,
+                # stop_secs: wait ~2s of silence before ending the student's turn so
+                # they can think mid-answer without the AI jumping in immediately.
+                vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=2.0)),
+            ),
+        )
+    except Exception:
+        await _register_pipeline_end()
+        raise
+
+    def _emit_subtitle_delta(text: str) -> None:
+        asyncio.create_task(broadcast(session_id, {
+            "type": "ai_text_delta",
+            "text": text,
+            "phase": state.current_phase.value,
+        }))
 
     gemini = InterviewGeminiLiveLLMService(
         api_key=settings.google_api_key,
@@ -623,6 +661,7 @@ async def run_interview_pipeline(
         ),
         system_instruction=initial_prompt,
         transcribe_user_audio=True,
+        on_subtitle_delta=_emit_subtitle_delta,
     )
     logger.info(f"Gemini Live | model={GEMINI_LIVE_MODEL} reconnect=goAway-only")
 
@@ -633,12 +672,18 @@ async def run_interview_pipeline(
     ])
     context_aggregator = LLMContextAggregatorPair(
         context,
-        user_params=LLMUserAggregatorParams(user_turn_stop_timeout=2.0),
+        user_params=LLMUserAggregatorParams(
+            user_turn_stop_timeout=2.0,
+            user_mute_strategies=[AlwaysUserMuteStrategy()],
+        ),
     )
 
     student_speech: dict[str, str] = {"pending": ""}
     bot_state: dict[str, bool] = {"responding": False}
     last_activity_at: float = time.time()
+    pending_control_notes: list[str] = []
+    last_control_at: float = 0.0
+    MIN_CONTROL_GAP_SEC = 8.0
 
     user_aggregator = context_aggregator.user()
 
@@ -662,16 +707,19 @@ async def run_interview_pipeline(
         bot_state=bot_state,
     )
 
+    # transport.output() MUST sit directly after gemini so TTS audio frames reach
+    # Daily without waiting behind turn scoring / WebSocket broadcasts in
+    # turn_processor (that blocking caused stammering / chopped speech).
     task = PipelineTask(
         Pipeline([
             transport.input(),
             context_aggregator.user(),
             gemini,
-            turn_processor,
             transport.output(),
+            turn_processor,
             context_aggregator.assistant(),
         ]),
-        params=PipelineParams(allow_interruptions=True, enable_metrics=False),
+        params=PipelineParams(allow_interruptions=False, enable_metrics=False),
     )
     turn_processor.task = task
 
@@ -857,23 +905,51 @@ async def run_interview_pipeline(
     #   29:57 → short goodbye (3 sec before hard cap), then end gracefully
     # All three are gated on the student actually being in the call.
 
-    async def _speak_to_student(internal_note: str, force: bool = False):
-        """Inject a control note and trigger Gemini to speak.
+    async def _flush_pending_controls():
+        """Deliver queued internal notes once the bot finishes speaking."""
+        nonlocal last_control_at
+        if ending or not pending_control_notes:
+            return
+        if bot_state["responding"] or gemini._bot_audio_playing:
+            return
+        if time.time() - last_control_at < MIN_CONTROL_GAP_SEC:
+            return
+        note = pending_control_notes.pop(0)
+        context.messages.append({"role": "user", "content": note})
+        sent = await gemini.send_control_turn(note)
+        if sent:
+            last_control_at = time.time()
+            bot_state["responding"] = True
+        else:
+            pending_control_notes.insert(0, note)
+            if not gemini._bot_audio_playing:
+                await task.queue_frames([LLMRunFrame()])
 
-        Uses send_client_content so prompts still work after goAway reconnects.
-        """
+    async def _speak_to_student(internal_note: str, force: bool = False):
+        """Inject a control note and trigger Gemini to speak when the line is clear."""
+        nonlocal last_control_at
         if ending:
             return
-        if bot_state["responding"] and not force:
-            logger.debug("Skipping timing injection — bot already responding")
+        if bot_state["responding"] or gemini._bot_audio_playing:
+            if force:
+                pending_control_notes.insert(0, internal_note)
+            else:
+                pending_control_notes.append(internal_note)
+            logger.debug("Queued control turn — bot speaking or responding")
             return
-        if bot_state["responding"] and force:
-            bot_state["responding"] = False
+        if not force and time.time() - last_control_at < MIN_CONTROL_GAP_SEC:
+            pending_control_notes.append(internal_note)
+            return
         context.messages.append({"role": "user", "content": internal_note})
         sent = await gemini.send_control_turn(internal_note)
-        if not sent:
-            logger.warning(f"send_control_turn failed — falling back to LLMRunFrame | session={session_id}")
-            await task.queue_frames([LLMRunFrame()])
+        if sent:
+            last_control_at = time.time()
+            bot_state["responding"] = True
+        else:
+            pending_control_notes.insert(0, internal_note)
+            logger.warning(
+                f"send_control_turn deferred — falling back later | session={session_id}"
+            )
 
     async def _after_gemini_reconnect():
         nonlocal last_activity_at
@@ -974,7 +1050,7 @@ async def run_interview_pipeline(
                     continue
                 if not state.pacing_ahead_of_schedule():
                     continue
-                if state.dynamic_injection_count >= 8:
+                if state.dynamic_injection_count >= 14:
                     continue
                 logger.info(
                     f"Pacing injection | session={session_id} "
@@ -982,9 +1058,9 @@ async def run_interview_pipeline(
                 )
                 state.extend_current_phase(extra_turns=4)
                 state.dynamic_injection_count += 1
-                injection = build_mid_interview_injection(state)
                 gemini._system_instruction = build_system_prompt(state)
-                await _speak_to_student(injection, force=True)
+                injection = await build_mid_interview_injection(state)
+                await _speak_to_student(injection)
         except asyncio.CancelledError:
             return
 
@@ -1040,10 +1116,6 @@ async def run_interview_pipeline(
     silence_recovery_task = asyncio.create_task(silence_recovery_watchdog())
     register_shutdown_handler(session_id, _shutdown_session)
 
-    # Count this pipeline as live right before we run it, so it is always
-    # paired with the _register_pipeline_end() in the finally below.
-    await _register_pipeline_start()
-
     runner = PipelineRunner()
     try:
         await runner.run(task)
@@ -1057,8 +1129,5 @@ async def run_interview_pipeline(
                 bg_task.cancel()
         remove_session_state(session_id)
         remove_session_connections(session_id)
-        # Daily's native context is process-wide. Only deinit when no other
-        # session is still live — see _register_pipeline_end(). Deinit-ing
-        # while another interview is active crashes the process (exit 134).
         await _register_pipeline_end()
         logger.info(f"Pipeline ended | session={session_id}")

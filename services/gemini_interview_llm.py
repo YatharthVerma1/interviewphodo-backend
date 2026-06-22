@@ -15,10 +15,16 @@ import asyncio
 import time
 from typing import Awaitable, Callable, Optional
 
-from google.genai.types import Content, Part
 from loguru import logger
 
-from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService
+from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService, GeminiVADParams
+
+try:
+    from pipecat.frames.frames import InterruptionFrame
+    from pipecat.processors.frame_processor import FrameDirection
+except ImportError:
+    InterruptionFrame = None  # type: ignore[misc, assignment]
+    FrameDirection = None  # type: ignore[misc, assignment]
 
 GEMINI_LIVE_MODEL = "models/gemini-3.1-flash-live-preview"
 
@@ -26,11 +32,16 @@ GEMINI_LIVE_MODEL = "models/gemini-3.1-flash-live-preview"
 class InterviewGeminiLiveLLMService(GeminiLiveLLMService):
     """Gemini Live with goAway reconnects and post-resume audio recovery."""
 
-    def __init__(self, *args, on_reconnected: Optional[Callable[[], Awaitable[None]]] = None, **kwargs):
+    def __init__(self, *args, on_reconnected: Optional[Callable[[], Awaitable[None]]] = None, on_subtitle_delta: Optional[Callable[[str], None]] = None, **kwargs):
         super().__init__(*args, **kwargs)
         self._on_reconnected = on_reconnected
+        self._on_subtitle_delta = on_subtitle_delta
         self._session_ready_event = asyncio.Event()
         self._reconnect_lock = asyncio.Lock()
+        self._bot_audio_playing = False
+        self._model_turn_started_at: Optional[float] = None
+        self._pending_output_text: list[str] = []
+        self._last_turn_spoken_text: str = ""
 
     @property
     def _system_instruction(self) -> Optional[str]:
@@ -83,13 +94,46 @@ class InterviewGeminiLiveLLMService(GeminiLiveLLMService):
                 except Exception as e:
                     logger.error(f"Post-reconnect hook failed: {e}")
 
+    def _bot_output_active(self) -> bool:
+        """True while Gemini or the speaker is outputting interviewer audio."""
+        return self._bot_audio_playing or self._bot_is_responding
+
+    def set_bot_audio_playing(self, playing: bool) -> None:
+        """Updated from transport BotStarted/StoppedSpeaking frames."""
+        self._bot_audio_playing = playing
+        # Stop sending mic audio to Gemini while the bot speaks — prevents echo
+        # from triggering activity_start / interrupted and chopping TTS audio.
+        self.set_audio_input_paused(playing)
+
+    async def _handle_user_started_speaking(self, frame) -> None:
+        if self._bot_output_active():
+            logger.debug("VAD user-start ignored while bot is speaking (echo guard)")
+            return
+        await super()._handle_user_started_speaking(frame)
+
+    async def _handle_user_stopped_speaking(self, frame) -> None:
+        if self._bot_output_active():
+            logger.debug("VAD user-stop ignored while bot is speaking (echo guard)")
+            return
+        await super()._handle_user_stopped_speaking(frame)
+
+    async def process_frame(self, frame, direction: FrameDirection):
+        """Drop local interruption frames — interviews do not support barge-in."""
+        if InterruptionFrame is not None and isinstance(frame, InterruptionFrame):
+            logger.debug("Dropping InterruptionFrame (interview no-barge-in)")
+            return
+        await super().process_frame(frame, direction)
+
     async def send_control_turn(self, text: str, *, wait_ready: bool = True) -> bool:
         """Send an internal control message and trigger a spoken response.
 
-        LLMRunFrame + context append does NOT reach Gemini Live after resumption;
-        we must use send_client_content directly.
+        Uses the realtime text path (same as user speech) so we do not stack a
+        second clientContent turn on top of live audio — that causes stammers.
         """
         if self._disconnecting:
+            return False
+        if self._bot_output_active():
+            logger.debug("send_control_turn deferred — bot still speaking")
             return False
         if wait_ready:
             if not self._session:
@@ -104,14 +148,51 @@ class InterviewGeminiLiveLLMService(GeminiLiveLLMService):
 
         await self.start_ttfb_metrics()
         try:
-            turn = Content(role="user", parts=[Part(text=text)])
-            await self._session.send_client_content(turns=[turn], turn_complete=True)
-            if self._is_gemini_3:
-                await self._session.send_realtime_input(text=" ")
+            await self._send_user_text(text)
             return True
         except Exception as e:
             logger.error(f"send_control_turn failed: {e}")
             return False
+
+    async def _set_bot_is_responding(self, responding: bool):
+        """Pause mic while Gemini is generating speech (before transport playback)."""
+        await super()._set_bot_is_responding(responding)
+        if responding:
+            self.set_audio_input_paused(True)
+        elif not self._bot_audio_playing:
+            self.set_audio_input_paused(False)
+
+    async def _handle_msg_output_transcription(self, message) -> None:
+        """Accumulate transcription only — pushing text frames here clogs Daily's audio queue."""
+        if not message.server_content or not message.server_content.output_transcription:
+            return
+        text = message.server_content.output_transcription.text
+        if not text:
+            return
+
+        self._search_result_buffer += text
+        self._llm_output_buffer += text
+        self._pending_output_text.append(text)
+
+        if message.server_content.grounding_metadata:
+            self._accumulated_grounding_metadata = message.server_content.grounding_metadata
+
+        if self._on_subtitle_delta:
+            try:
+                self._on_subtitle_delta(text)
+            except Exception as e:
+                logger.debug(f"subtitle callback failed: {e}")
+
+        # TTSStarted / LLMFullResponseStart are opened by the first audio chunk in
+        # _handle_msg_model_turn — do NOT push text frames until turn_complete.
+
+    async def _handle_msg_turn_complete(self, message) -> None:
+        pending = "".join(self._pending_output_text).strip()
+        self._pending_output_text = []
+        self._last_turn_spoken_text = pending
+        if pending:
+            await self._push_output_transcription_text_frames(pending)
+        await super()._handle_msg_turn_complete(message)
 
     async def _handle_session_ready(self, session) -> None:
         await super()._handle_session_ready(session)
@@ -122,9 +203,12 @@ class InterviewGeminiLiveLLMService(GeminiLiveLLMService):
         """Process one LiveServerMessage (mirrors pipecat 0.0.108 handler body)."""
         sc = message.server_content
         if sc and sc.interrupted:
-            logger.debug("Gemini VAD: interrupted signal received")
-            await self.broadcast_interruption()
+            # Never honor server-side interrupts in interviews — echo from the
+            # student's speakers otherwise chops TTS mid-word (stammering).
+            logger.debug("Gemini interrupted signal ignored (interview no-barge-in)")
         if sc and sc.model_turn:
+            if self._model_turn_started_at is None:
+                self._model_turn_started_at = time.time()
             await self._handle_msg_model_turn(message)
         if sc and sc.input_transcription:
             await self._handle_msg_input_transcription(message)
@@ -138,6 +222,7 @@ class InterviewGeminiLiveLLMService(GeminiLiveLLMService):
         ):
             await self._handle_msg_grounding_metadata(message)
         if sc and sc.turn_complete:
+            self._model_turn_started_at = None
             if not message.usage_metadata:
                 logger.warning("Received turn_complete without usage_metadata")
             await self._handle_msg_turn_complete(message)
@@ -182,14 +267,14 @@ class InterviewGeminiLiveLLMService(GeminiLiveLLMService):
 
 
 def default_interview_gemini_settings(**overrides) -> GeminiLiveLLMService.Settings:
-    """Live settings tuned for 25–30 min audio interviews."""
+    """Live settings tuned for smooth 25–30 min audio interviews."""
     base = dict(
         voice="Charon",
-        temperature=0.7,
-        context_window_compression={
-            "enabled": True,
-            "trigger_tokens": 28000,
-        },
+        temperature=0.55,
+        # Silero VAD on Daily handles turn-taking; Gemini server VAD causes echo interrupts.
+        vad=GeminiVADParams(disabled=True),
+        thinking={"thinking_level": "MINIMAL"},
+        context_window_compression={"enabled": False},
     )
     base.update(overrides)
     return GeminiLiveLLMService.Settings(**base)

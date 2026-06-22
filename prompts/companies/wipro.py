@@ -2,7 +2,7 @@
 WIPRO_CONFIG = {
     "company_id":       "wipro",
     "company_name":     "Wipro",
-    "interviewer_name": "Anjali Nair",
+    "interviewer_name": "Vikhyat Nair",
     "interviewer_role": "HR Business Partner",
     "style": "Friendly and process-oriented. Less technically intense than TCS at "
              "fresher level. Focus on communication, team fit, and positive attitude.",

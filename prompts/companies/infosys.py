@@ -2,7 +2,7 @@
 INFOSYS_CONFIG = {
     "company_id":       "infosys",
     "company_name":     "Infosys",
-    "interviewer_name": "Priya Sharma",
+    "interviewer_name": "Ajay Sharma",
     "interviewer_role": "Talent Acquisition Lead",
     "style": "Moderately formal. Infosys values problem-solving attitude, adaptability, "
              "and learning mindset. More conversational than TCS. No bond.",

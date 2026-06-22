@@ -2,7 +2,7 @@
 TECH_MAHINDRA_CONFIG = {
     "company_id":       "tech_mahindra",
     "company_name":     "Tech Mahindra",
-    "interviewer_name": "Vikram Rao",
+    "interviewer_name": "Vikram Gupta",
     "interviewer_role": "Talent Acquisition Specialist",
     "style": "Conversational, moderately formal. Strong telecom background — "
              "networking knowledge genuinely valued. Less strict than TCS.",

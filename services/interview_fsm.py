@@ -60,52 +60,54 @@ HERO_PHASE_BY_ROUND: dict[str, InterviewPhase] = {
 ROUND_PHASE_PLAN: dict[str, list[tuple["InterviewPhase", int]]] = {
     "technical": [
         (InterviewPhase.INTRO,        3),
-        (InterviewPhase.RESUME,      10),
-        (InterviewPhase.TECHNICAL,   28),
-        (InterviewPhase.BEHAVIORAL,  12),
-        (InterviewPhase.CANDIDATE_QA, 6),
+        (InterviewPhase.RESUME,      12),
+        (InterviewPhase.TECHNICAL,   32),
+        (InterviewPhase.BEHAVIORAL,  26),
+        (InterviewPhase.CANDIDATE_QA, 12),
         (InterviewPhase.CLOSING,      4),
     ],
     "managerial": [
         (InterviewPhase.INTRO,        3),
-        (InterviewPhase.RESUME,      12),
-        (InterviewPhase.BEHAVIORAL,  28),
-        (InterviewPhase.CANDIDATE_QA, 8),
+        (InterviewPhase.RESUME,      14),
+        (InterviewPhase.BEHAVIORAL,  32),
+        (InterviewPhase.CANDIDATE_QA, 14),
         (InterviewPhase.CLOSING,      4),
     ],
     "hr": [
         (InterviewPhase.INTRO,        3),
-        (InterviewPhase.RESUME,      10),
-        (InterviewPhase.HR_ROUND,    28),
-        (InterviewPhase.BEHAVIORAL,  12),
-        (InterviewPhase.CANDIDATE_QA, 6),
+        (InterviewPhase.RESUME,      12),
+        (InterviewPhase.HR_ROUND,    32),
+        (InterviewPhase.BEHAVIORAL,  26),
+        (InterviewPhase.CANDIDATE_QA, 12),
         (InterviewPhase.CLOSING,      4),
     ],
     "full": [
         (InterviewPhase.INTRO,        3),
         (InterviewPhase.RESUME,      12),
         (InterviewPhase.TECHNICAL,   20),
-        (InterviewPhase.BEHAVIORAL,  16),
-        (InterviewPhase.HR_ROUND,    16),
-        (InterviewPhase.CANDIDATE_QA, 8),
+        (InterviewPhase.BEHAVIORAL,  34),
+        (InterviewPhase.HR_ROUND,    34),
+        (InterviewPhase.CANDIDATE_QA, 16),
         (InterviewPhase.CLOSING,      4),
     ],
     "coaching": [
         (InterviewPhase.INTRO,        3),
         (InterviewPhase.RESUME,      10),
         (InterviewPhase.TECHNICAL,   12),
-        (InterviewPhase.BEHAVIORAL,  12),
-        (InterviewPhase.HR_ROUND,    12),
-        (InterviewPhase.CANDIDATE_QA, 6),
+        # Coaching uses ~2 student turns per coached question — budgets are high
+        # so behavioral / HR / Q&A still feel as long as intro + resume + technical.
+        (InterviewPhase.BEHAVIORAL,  30),
+        (InterviewPhase.HR_ROUND,    30),
+        (InterviewPhase.CANDIDATE_QA, 14),
         (InterviewPhase.CLOSING,      4),
     ],
     "multi_persona": [
         (InterviewPhase.INTRO,        3),
-        (InterviewPhase.RESUME,      12),
-        (InterviewPhase.TECHNICAL,   16),
-        (InterviewPhase.BEHAVIORAL,  14),
-        (InterviewPhase.HR_ROUND,    14),
-        (InterviewPhase.CANDIDATE_QA, 6),
+        (InterviewPhase.RESUME,      14),
+        (InterviewPhase.TECHNICAL,   22),
+        (InterviewPhase.BEHAVIORAL,  30),
+        (InterviewPhase.HR_ROUND,    30),
+        (InterviewPhase.CANDIDATE_QA, 14),
         (InterviewPhase.CLOSING,      4),
     ],
 }
@@ -152,6 +154,8 @@ class InterviewState:
     # Can be overridden by user-supplied value at session start.
     difficulty_level: str = "medium"
     dynamic_injection_count: int = 0
+    # Tracks mid-phase Gemini injections at 50% / 75% of each phase budget.
+    mid_injection_marks: set = field(default_factory=set)
     started_at:    float = field(default_factory=time.time)
     # Set when the student actually joins the Daily room (interview clock starts).
     joined_at:     Optional[float] = None
@@ -281,6 +285,57 @@ class InterviewState:
         progress = elapsed / MIN_INTERVIEW_SEC
         expected_turns = int(self.total_turn_budget() * progress * 0.75)
         return self.total_turns >= max(expected_turns + 4, 8)
+
+    def extend_later_phases_if_early(self, min_elapsed_sec: int = 20 * 60) -> bool:
+        """Top up remaining phase budgets when the session is still short on time."""
+        from services.interview_timing import MIN_INTERVIEW_SEC
+
+        elapsed = self.get_interview_elapsed_seconds()
+        if elapsed >= min_elapsed_sec or elapsed >= MIN_INTERVIEW_SEC:
+            return False
+
+        floors = {
+            InterviewPhase.TECHNICAL: 28,
+            InterviewPhase.BEHAVIORAL: 26,
+            InterviewPhase.HR_ROUND: 26,
+            InterviewPhase.CANDIDATE_QA: 12,
+            InterviewPhase.RESUME: 12,
+        }
+        if self.round_type == "coaching":
+            floors = {k: v + 4 for k, v in floors.items()}
+
+        boosted = False
+        current_idx = self.phase_order.index(self.current_phase) if self.current_phase in self.phase_order else -1
+        for phase in self.phase_order[current_idx + 1:]:
+            if phase == InterviewPhase.CLOSING:
+                continue
+            floor = floors.get(phase, 18)
+            if self.phase_budgets.get(phase, 0) < floor:
+                self.phase_budgets[phase] = floor
+                boosted = True
+        return boosted
+
+    def mid_inject_milestone(self) -> Optional[int]:
+        """Return 75 if a mid-phase question-bank refresh should run now."""
+        if self.current_phase in {
+            InterviewPhase.INTRO,
+            InterviewPhase.CLOSING,
+        }:
+            return None
+        budget = self.get_phase_budget()
+        if budget < 6:
+            return None
+        pct = 75
+        mark = f"{self.current_phase.value}:{pct}"
+        if mark in self.mid_injection_marks:
+            return None
+        threshold = max(1, (budget * pct) // 100)
+        if self.phase_turn >= threshold:
+            return pct
+        return None
+
+    def mark_mid_injected(self, pct: int) -> None:
+        self.mid_injection_marks.add(f"{self.current_phase.value}:{pct}")
 
     def record_turn(
         self,
