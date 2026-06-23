@@ -12,6 +12,7 @@ from models.user import UserProfile, UserUpdateRequest
 from prompts.role_pools import normalize_target_role, normalize_timeline
 from config import settings
 from services.credits import owner_profile_view, get_user_with_synced_subscription
+from services.account_link import ensure_user_profile, reconcile_profile_with_auth
 
 LOCAL_UPLOAD_ROOT = Path(__file__).resolve().parent.parent / "uploads" / "resumes"
 
@@ -37,18 +38,33 @@ async def get_current_user(
 
     try:
         auth_response = supabase_admin.auth.get_user(token)
-        user_id = auth_response.user.id
+        auth_user = auth_response.user
+        user_id = auth_user.id
+        jwt_email = auth_user.email
 
-        profile = supabase_admin.table("users") \
-            .select("*") \
-            .eq("id", user_id) \
-            .single() \
-            .execute()
+        try:
+            profile = supabase_admin.table("users") \
+                .select("*") \
+                .eq("id", user_id) \
+                .single() \
+                .execute()
+            user_row = profile.data
+        except Exception:
+            user_row = None
 
-        if not profile.data:
-            raise HTTPException(status_code=404, detail="User profile not found")
+        if not user_row:
+            user_row = ensure_user_profile(user_id, jwt_email)
 
-        return get_user_with_synced_subscription(profile.data)
+        user_row = reconcile_profile_with_auth(
+            user_row,
+            auth_user_id=user_id,
+            auth_email=jwt_email,
+        )
+
+        synced = get_user_with_synced_subscription(user_row, jwt_email=jwt_email)
+        if jwt_email and not synced.get("email"):
+            synced["email"] = jwt_email.strip().lower()
+        return synced
 
     except HTTPException:
         raise
@@ -58,7 +74,7 @@ async def get_current_user(
 
 @router.get("/me", response_model=UserProfile)
 async def get_me(current_user: dict = Depends(get_current_user)):
-    return owner_profile_view(current_user)
+    return owner_profile_view(current_user, jwt_email=current_user.get("email"))
 
 
 @router.patch("/me")

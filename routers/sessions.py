@@ -14,6 +14,7 @@ from prompts.companies import VALID_COMPANIES
 from prompts.role_pools import normalize_target_role
 from database.supabase_client import fetch_one, supabase_admin
 from config import settings
+from services.credits import is_owner_user
 from services.credits import interview_access_status
 
 router = APIRouter()
@@ -93,7 +94,7 @@ async def start_session(
         ud,
         mode="video",
         round_type=round_type,
-        is_owner=settings.is_owner_email(current_user.get("email")),
+        is_owner=is_owner_user(current_user),
     )
     if not access["can_start"]:
         status_code = 403 if access.get("reason") == "pro_required" else 402

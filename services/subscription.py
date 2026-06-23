@@ -169,10 +169,14 @@ def fetch_user_subscription_row(user_id: str) -> dict[str, Any] | None:
         return None
 
 
-def get_user_with_synced_subscription(user_row: dict[str, Any]) -> dict[str, Any]:
+def get_user_with_synced_subscription(
+    user_row: dict[str, Any],
+    *,
+    jwt_email: str | None = None,
+) -> dict[str, Any]:
     from services.credits import is_owner_user
 
-    if is_owner_user(user_row):
+    if is_owner_user(user_row, jwt_email=jwt_email):
         return user_row
     return sync_subscription_state(user_row)
 

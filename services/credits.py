@@ -33,16 +33,21 @@ __all__ = [
 OWNER_UNLIMITED_CREDITS = 999_999
 
 
-def is_owner_user(user: dict[str, Any] | str | None) -> bool:
-    if user is None:
+def is_owner_user(user: dict[str, Any] | str | None, *, jwt_email: str | None = None) -> bool:
+    if user is None and not jwt_email:
         return False
-    email = user if isinstance(user, str) else user.get("email")
-    return settings.is_owner_email(email)
+    if isinstance(user, str):
+        emails = [user]
+    else:
+        emails = [user.get("email")]
+    if jwt_email:
+        emails.append(jwt_email)
+    return any(settings.is_owner_email(e) for e in emails if e)
 
 
-def owner_profile_view(profile: dict[str, Any]) -> dict[str, Any]:
+def owner_profile_view(profile: dict[str, Any], *, jwt_email: str | None = None) -> dict[str, Any]:
     """Owners see lifetime Pro with unlimited credits — never expires or deducts."""
-    if not is_owner_user(profile):
+    if not is_owner_user(profile, jwt_email=jwt_email):
         return enrich_profile_subscription(profile)
     out = dict(profile)
     used = int(out.get("sessions_used") or 0)
