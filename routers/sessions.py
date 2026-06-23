@@ -14,7 +14,7 @@ from prompts.companies import VALID_COMPANIES
 from prompts.role_pools import normalize_target_role
 from database.supabase_client import fetch_one, supabase_admin
 from config import settings
-from services.credits import has_sessions_remaining
+from services.credits import interview_access_status
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -80,16 +80,24 @@ async def start_session(
     # join their session are not charged).
     ud = fetch_one(
         supabase_admin.table("users")
-        .select("sessions_used, sessions_limit, resume_text, target_role")
+        .select(
+            "id, plan, sessions_used, sessions_limit, resume_text, target_role, "
+            "subscription_starts_at, subscription_ends_at"
+        )
         .eq("id", current_user["id"])
     )
     if not ud:
         raise HTTPException(404, "User profile not found")
-    if not has_sessions_remaining(ud, current_user.get("email")):
-        raise HTTPException(
-            402,
-            "No sessions remaining. Purchase a pack at interviewphodo.com/pricing",
-        )
+
+    access = interview_access_status(
+        ud,
+        mode="video",
+        round_type=round_type,
+        is_owner=settings.is_owner_email(current_user.get("email")),
+    )
+    if not access["can_start"]:
+        status_code = 403 if access.get("reason") == "pro_required" else 402
+        raise HTTPException(status_code=status_code, detail=access["message"])
 
     # Create Daily.co room
     unique_id = uuid.uuid4().hex[:12]

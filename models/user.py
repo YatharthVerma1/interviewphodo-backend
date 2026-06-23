@@ -14,9 +14,22 @@ class UserProfile(BaseModel):
     target_role: Optional[str] = None
     interview_timeline: Optional[str] = None
     sessions_used: int = 0
-    sessions_limit: int = 2
+    sessions_limit: int = 3
     plan: str = "free"
+    subscription_starts_at: Optional[datetime] = None
+    subscription_ends_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
+    # Computed by API (not stored in DB)
+    credits_remaining: Optional[int] = None
+    subscription_active: Optional[bool] = None
+    subscription_days_left: Optional[int] = None
+    can_start_interview: Optional[bool] = None
+    access_blocked_reason: Optional[str] = None
+    access_message: Optional[str] = None
+    plan_label: Optional[str] = None
+    is_paid_plan: Optional[bool] = None
+    is_owner: Optional[bool] = None
+    owner_lifetime_access: Optional[bool] = None
 
 
 class UserUpdateRequest(BaseModel):

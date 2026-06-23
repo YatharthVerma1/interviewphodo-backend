@@ -13,6 +13,7 @@ from loguru import logger
 from config import settings
 from database.supabase_client import fetch_one, supabase_admin
 from services.credits import is_owner_user
+from services.pricing import VIDEO_INTERVIEW_CREDITS
 
 # ---------------------------------------------------------------------------
 # Daily global-context guard.
@@ -820,11 +821,14 @@ async def run_interview_pipeline(
                     current = supabase_admin.table("users").select(
                         "sessions_used"
                     ).eq("id", user_id).single().execute()
-                    new_used = (current.data["sessions_used"] or 0) + 1
+                    new_used = (current.data["sessions_used"] or 0) + VIDEO_INTERVIEW_CREDITS
                     supabase_admin.table("users").update({
                         "sessions_used": new_used,
                     }).eq("id", user_id).execute()
-                    logger.info(f"Credit deducted | user={user_id} sessions_used={new_used}")
+                    logger.info(
+                        f"Credit deducted | user={user_id} "
+                        f"credits_used={new_used} cost={VIDEO_INTERVIEW_CREDITS}"
+                    )
                 except Exception as e:
                     logger.error(f"Failed to deduct credit: {e}")
         await task.queue_frames([LLMRunFrame()])

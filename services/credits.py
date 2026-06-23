@@ -1,10 +1,36 @@
-"""Session credit checks — owner bypass via OWNER_EMAILS in .env (never committed)."""
+"""Credit checks — delegates to subscription.py. Owner bypass via OWNER_EMAILS."""
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from config import settings
+from services.subscription import (
+    InterviewMode,
+    can_start_interview,
+    credit_cost,
+    credits_remaining,
+    enrich_profile_subscription,
+    get_user_with_synced_subscription,
+    interview_access_status,
+)
+
+__all__ = [
+    "InterviewMode",
+    "credit_cost",
+    "credits_remaining",
+    "is_owner_user",
+    "owner_profile_view",
+    "has_sessions_remaining",
+    "has_credits_remaining",
+    "get_user_with_synced_subscription",
+    "enrich_profile_subscription",
+    "interview_access_status",
+    "OWNER_UNLIMITED_CREDITS",
+]
+
+# Effectively infinite for owner testing accounts.
+OWNER_UNLIMITED_CREDITS = 999_999
 
 
 def is_owner_user(user: dict[str, Any] | str | None) -> bool:
@@ -15,19 +41,43 @@ def is_owner_user(user: dict[str, Any] | str | None) -> bool:
 
 
 def owner_profile_view(profile: dict[str, Any]) -> dict[str, Any]:
-    """API-only view: owners see plan=owner and effectively unlimited credits."""
+    """Owners see lifetime Pro with unlimited credits — never expires or deducts."""
     if not is_owner_user(profile):
-        return profile
+        return enrich_profile_subscription(profile)
     out = dict(profile)
     used = int(out.get("sessions_used") or 0)
-    out["plan"] = "owner"
-    out["sessions_limit"] = used + 9999
+    out["is_owner"] = True
+    out["owner_lifetime_access"] = True
+    out["plan"] = "pro"
+    out["plan_label"] = "Pro"
+    out["is_paid_plan"] = True
+    out["sessions_limit"] = used + OWNER_UNLIMITED_CREDITS
+    out["credits_remaining"] = OWNER_UNLIMITED_CREDITS
+    out["subscription_active"] = True
+    out["subscription_days_left"] = None
+    out["can_start_interview"] = True
+    out["access_blocked_reason"] = None
+    out["access_message"] = None
     return out
 
 
-def has_sessions_remaining(user_row: dict[str, Any], email: str | None) -> bool:
+def has_sessions_remaining(
+    user_row: dict[str, Any],
+    email: str | None,
+    *,
+    mode: InterviewMode = "video",
+    round_type: str | None = None,
+) -> bool:
     if is_owner_user({"email": email}):
         return True
-    used = int(user_row.get("sessions_used") or 0)
-    limit = int(user_row.get("sessions_limit") or 0)
-    return used < limit
+    user_row = get_user_with_synced_subscription(user_row)
+    return can_start_interview(
+        user_row,
+        email,
+        mode=mode,
+        round_type=round_type,
+        is_owner=False,
+    )
+
+
+has_credits_remaining = has_sessions_remaining

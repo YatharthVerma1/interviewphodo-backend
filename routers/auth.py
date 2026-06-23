@@ -11,7 +11,7 @@ from database.supabase_client import supabase_admin
 from models.user import UserProfile, UserUpdateRequest
 from prompts.role_pools import normalize_target_role, normalize_timeline
 from config import settings
-from services.credits import owner_profile_view
+from services.credits import owner_profile_view, get_user_with_synced_subscription
 
 LOCAL_UPLOAD_ROOT = Path(__file__).resolve().parent.parent / "uploads" / "resumes"
 
@@ -48,7 +48,7 @@ async def get_current_user(
         if not profile.data:
             raise HTTPException(status_code=404, detail="User profile not found")
 
-        return profile.data
+        return get_user_with_synced_subscription(profile.data)
 
     except HTTPException:
         raise

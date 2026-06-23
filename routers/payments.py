@@ -7,14 +7,13 @@ from pydantic import BaseModel
 from config import settings
 from database.supabase_client import fetch_one, supabase_admin
 from routers.auth import get_current_user
+from services.credits import enrich_profile_subscription, owner_profile_view
+from services.pricing import PAYMENT_PACKS, plans_for_api
+from services.subscription import activate_paid_subscription
 
 router = APIRouter()
 
-PACKS = {
-    "trial": {"amount_paise": 9900, "sessions": 2, "label": "Trial — 2 sessions"},
-    "starter": {"amount_paise": 24900, "sessions": 5, "label": "Starter — 5 sessions"},
-    "standard": {"amount_paise": 44900, "sessions": 10, "label": "Standard — 10 sessions"},
-}
+PACKS = PAYMENT_PACKS
 
 
 class OrderRequest(BaseModel):
@@ -27,12 +26,38 @@ def _get_razorpay_client():
             status_code=503,
             detail=(
                 "Payments are not enabled in this environment. "
-                "Razorpay integration is deferred — for now, top up sessions "
-                "directly in Supabase by updating the users.sessions_limit column."
+                "Razorpay integration is deferred — for now, activate plans "
+                "manually in Supabase (plan, sessions_limit, subscription_ends_at)."
             ),
         )
     import razorpay
     return razorpay.Client(auth=(settings.razorpay_key_id, settings.razorpay_key_secret))
+
+
+@router.get("/plans")
+async def list_plans():
+    """Public pricing plans with credit costs and access windows."""
+    return {"plans": plans_for_api()}
+
+
+@router.get("/subscription")
+async def my_subscription(current_user: dict = Depends(get_current_user)):
+    """Current user's plan, credits, and access window (synced / expiry-checked)."""
+    view = owner_profile_view(enrich_profile_subscription(current_user))
+    return {
+        "plan": view.get("plan"),
+        "plan_label": view.get("plan_label"),
+        "credits_used": view.get("sessions_used", 0),
+        "credits_limit": view.get("sessions_limit", 0),
+        "credits_remaining": view.get("credits_remaining", 0),
+        "subscription_starts_at": view.get("subscription_starts_at"),
+        "subscription_ends_at": view.get("subscription_ends_at"),
+        "subscription_active": view.get("subscription_active"),
+        "subscription_days_left": view.get("subscription_days_left"),
+        "can_start_interview": view.get("can_start_interview"),
+        "access_blocked_reason": view.get("access_blocked_reason"),
+        "access_message": view.get("access_message"),
+    }
 
 
 @router.post("/create-order")
@@ -64,7 +89,7 @@ async def create_order(
         "razorpay_order_id": order["id"],
         "amount_paise": pack["amount_paise"],
         "pack_type": body.pack_type,
-        "sessions_granted": pack["sessions"],
+        "sessions_granted": pack["credits"],
     }).execute()
 
     return {
@@ -73,6 +98,9 @@ async def create_order(
         "currency": "INR",
         "razorpay_key": settings.razorpay_key_id,
         "pack_label": pack["label"],
+        "credits": pack["credits"],
+        "access_days": pack["access_days"],
+        "plan": pack["plan"],
     }
 
 
@@ -109,20 +137,14 @@ async def verify_payment(
     if order_row["status"] == "paid":
         return {"status": "already_processed"}
 
-    sessions_to_add = order_row["sessions_granted"]
+    pack = PACKS.get(order_row["pack_type"], {})
+    plan_name = pack.get("plan", order_row["pack_type"])
+    credits_granted = int(pack.get("credits") or order_row["sessions_granted"])
 
-    user = fetch_one(
-        supabase_admin.table("users")
-        .select("sessions_limit")
-        .eq("id", current_user["id"])
-    )
-    if not user:
-        raise HTTPException(404, "User profile not found")
-    new_limit = user["sessions_limit"] + sessions_to_add
-
-    supabase_admin.table("users").update({
-        "sessions_limit": new_limit
-    }).eq("id", current_user["id"]).execute()
+    try:
+        updated_user = activate_paid_subscription(current_user["id"], plan_name)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to activate subscription: {e}")
 
     supabase_admin.table("payment_orders").update({
         "status": "paid",
@@ -130,10 +152,15 @@ async def verify_payment(
         "paid_at": "now()",
     }).eq("razorpay_order_id", order_id).execute()
 
+    view = enrich_profile_subscription(updated_user)
     return {
         "status": "success",
-        "sessions_added": sessions_to_add,
-        "new_session_limit": new_limit,
+        "plan": plan_name,
+        "credits_granted": credits_granted,
+        "credits_remaining": view.get("credits_remaining"),
+        "subscription_starts_at": view.get("subscription_starts_at"),
+        "subscription_ends_at": view.get("subscription_ends_at"),
+        "subscription_days_left": view.get("subscription_days_left"),
     }
 
 
