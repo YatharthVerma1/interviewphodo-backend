@@ -6,6 +6,7 @@ import logging
 from typing import Any
 
 from database.supabase_client import supabase_admin
+from services.pricing import FREE_PLAN_CREDITS
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +105,7 @@ def ensure_user_profile(auth_user_id: str, auth_email: str | None) -> dict[str, 
         "email": email or f"{auth_user_id}@users.interviewphodo.local",
         "plan": "free",
         "sessions_used": 0,
-        "sessions_limit": 3,
+        "sessions_limit": FREE_PLAN_CREDITS,
     }
     result = supabase_admin.table("users").insert(payload).execute()
     if not result.data:

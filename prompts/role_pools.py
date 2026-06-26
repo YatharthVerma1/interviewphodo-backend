@@ -181,6 +181,34 @@ def get_role_pool(target_role: str | None) -> dict | None:
     return ROLE_POOLS.get(key)
 
 
+def build_timeline_prompt_block(timeline: str | None) -> str:
+    """Tune interview urgency based on when the student expects real interviews."""
+    if not timeline:
+        return ""
+    blocks = {
+        "this_week": (
+            "Interview timeline: THIS WEEK — be focused and efficient. "
+            "Prioritise high-yield questions; minimal small talk after intro."
+        ),
+        "two_to_four_weeks": (
+            "Interview timeline: 2–4 WEEKS — balance warm-up with rigorous practice. "
+            "Mix fundamentals with one stretch question per phase."
+        ),
+        "one_to_three_months": (
+            "Interview timeline: 1–3 MONTHS — teach frameworks and depth. "
+            "Coaching-style hints are OK when the student is stuck."
+        ),
+        "exploring": (
+            "Interview timeline: EXPLORING — encourage confidence-building. "
+            "Explain why strong answers work; keep pressure moderate."
+        ),
+    }
+    text = blocks.get(timeline)
+    if not text:
+        return ""
+    return f"\n=== INTERVIEW TIMELINE ===\n{text}\n"
+
+
 def build_role_prompt_block(target_role: str | None) -> str:
     """Inject ~50% role-specific question guidance into Gemini system prompt."""
     pool = get_role_pool(target_role)

@@ -99,6 +99,11 @@ async def avatar_websocket(
                                 event.get("event_type", "unknown"),
                                 event.get("message", ""),
                             )
+                    elif event.get("type") == "eye_contact_sample":
+                        from services.interview_fsm import get_session_state
+                        state = get_session_state(session_id)
+                        if state and event.get("score") is not None:
+                            state.add_eye_contact_sample(int(event["score"]))
                 except Exception:
                     pass  # Ignore malformed messages
 

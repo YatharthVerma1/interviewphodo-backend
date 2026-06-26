@@ -76,11 +76,13 @@ def score_turn(
     student_text: str,
     ai_text: str,
     filler_words: Optional[list] = None,
+    round_type: str = "full",
 ) -> tuple[Optional[int], str]:
     """Return (score 1-10 or None, feedback string) for one interview turn."""
     fillers = filler_words or []
     student = (student_text or "").strip()
     ai = (ai_text or "").strip()
+    coaching = (round_type or "").lower() == "coaching"
 
     if phase in _SKIP_PHASES:
         return None, ""
@@ -101,11 +103,11 @@ def score_turn(
     if score is None:
         score = _heuristic_score(phase, student, fillers)
         if not feedback:
-            feedback = _heuristic_feedback(phase, student, fillers, score)
+            feedback = _heuristic_feedback(phase, student, fillers, score, coaching=coaching)
 
     score = max(1, min(10, score))
     if not feedback:
-        feedback = _heuristic_feedback(phase, student, fillers, score)
+        feedback = _heuristic_feedback(phase, student, fillers, score, coaching=coaching)
 
     # Strip score tags from feedback shown to the student
     feedback = _SCORE_TAG_RE.sub("", feedback).strip()
@@ -227,7 +229,7 @@ def _heuristic_score(phase: str, student_text: str, fillers: list) -> int:
     return max(1, min(10, score))
 
 
-def _heuristic_feedback(phase: str, student_text: str, fillers: list, score: int) -> str:
+def _heuristic_feedback(phase: str, student_text: str, fillers: list, score: int, *, coaching: bool = False) -> str:
     words = student_text.split()
     word_count = len(words)
     parts: list[str] = []
@@ -243,7 +245,7 @@ def _heuristic_feedback(phase: str, student_text: str, fillers: list, score: int
 
     if word_count < 20:
         parts.append("Try to elaborate with a concrete example from your projects or college work.")
-    if len(fillers) >= 3:
+    if coaching and len(fillers) >= 3:
         parts.append(f"You used {len(fillers)} filler words — pause silently instead of saying 'um' or 'basically'.")
 
     if phase == "behavioral":

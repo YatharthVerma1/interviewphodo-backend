@@ -5,6 +5,10 @@ from __future__ import annotations
 from collections import defaultdict
 
 
+def _sort_timeline_by_date(items: list[dict]) -> list[dict]:
+    return sorted(items, key=lambda x: x.get("date") or "")
+
+
 def adapt_progress_for_frontend(data: dict) -> dict:
     """Merge detailed progress with fields expected by progress.tsx."""
     score_timeline = data.get("score_timeline") or []
@@ -19,16 +23,31 @@ def adapt_progress_for_frontend(data: dict) -> dict:
 
     return {
         **data,
-        "total_sessions": data.get("total_completed") or data.get("total_with_reports") or 0,
+        "total_sessions": max(
+            data.get("total_completed") or 0,
+            data.get("total_with_reports") or 0,
+            len(scores),
+        ),
         "avg_score": round(sum(scores) / len(scores), 1) if scores else 0,
         "best_score": max(scores) if scores else 0,
         "sessions_by_company": sessions_by_company,
         "sessions_by_round": sessions_by_round,
         "score_trend": [
             {"date": item.get("date"), "score": item.get("score")}
-            for item in score_timeline
+            for item in _sort_timeline_by_date(score_timeline)
             if item.get("date") is not None and item.get("score") is not None
         ],
+        "filler_timeline": [
+            {"date": item.get("date"), "value": item.get("value", 0)}
+            for item in _sort_timeline_by_date(data.get("filler_timeline") or [])
+            if item.get("date") is not None
+        ],
+        "wpm_timeline": [
+            {"date": item.get("date"), "value": item.get("value", 0)}
+            for item in _sort_timeline_by_date(data.get("wpm_timeline") or [])
+            if item.get("date") is not None
+        ],
+        "performance_insights": data.get("performance_insights") or {"going_well": [], "work_on": []},
     }
 
 

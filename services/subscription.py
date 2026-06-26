@@ -20,6 +20,7 @@ from typing import Any, Literal
 
 from database.supabase_client import supabase_admin
 from services.pricing import (
+    FREE_PLAN_CREDITS,
     PAID_PLAN_IDS,
     PRO_ONLY_ROUNDS,
     VIDEO_INTERVIEW_CREDITS,
@@ -124,6 +125,47 @@ def downgrade_expired_payload(user_row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def ensure_free_tier_credits(user_row: dict[str, Any]) -> dict[str, Any]:
+    """
+    Legacy Supabase signup triggers still create free users with sessions_limit=2.
+    Free plan is 3 credits — repair untouched accounts (used=0) on first API hit.
+    """
+    plan = (user_row.get("plan") or "free").lower()
+    if plan != "free":
+        return user_row
+
+    used = int(user_row.get("sessions_used") or 0)
+    limit = int(user_row.get("sessions_limit") or 0)
+    if used != 0 or limit >= FREE_PLAN_CREDITS:
+        return user_row
+
+    user_id = user_row.get("id")
+    if not user_id:
+        return user_row
+
+    try:
+        result = (
+            supabase_admin.table("users")
+            .update({"sessions_limit": FREE_PLAN_CREDITS})
+            .eq("id", user_id)
+            .execute()
+        )
+        if result.data:
+            logger.info(
+                "Repaired free plan credits | user=%s %s -> %s",
+                user_id,
+                limit,
+                FREE_PLAN_CREDITS,
+            )
+            return result.data[0]
+    except Exception as e:
+        logger.error("Failed to repair free credits | user=%s: %s", user_id, e)
+
+    merged = dict(user_row)
+    merged["sessions_limit"] = FREE_PLAN_CREDITS
+    return merged
+
+
 def sync_subscription_state(user_row: dict[str, Any]) -> dict[str, Any]:
     """If paid access expired, downgrade in DB and return the fresh row."""
     if not subscription_expired(user_row):
@@ -178,6 +220,7 @@ def get_user_with_synced_subscription(
 
     if is_owner_user(user_row, jwt_email=jwt_email):
         return user_row
+    user_row = ensure_free_tier_credits(user_row)
     return sync_subscription_state(user_row)
 
 

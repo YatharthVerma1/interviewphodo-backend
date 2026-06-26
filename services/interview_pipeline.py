@@ -62,6 +62,7 @@ def _extract_latest_student_text(context) -> str:
     skip_prefixes = (
         "[INTERNAL",
         "Please introduce yourself and start the interview now.",
+        "The student has joined the video room.",
     )
     for msg in reversed(messages):
         role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", None)
@@ -339,6 +340,7 @@ async def run_interview_pipeline(
                 student_text=student_text,
                 ai_text=ai_text,
                 filler_words=fillers,
+                round_type=self.state.round_type,
             )
 
             phase = self.state.current_phase.value
@@ -440,6 +442,11 @@ async def run_interview_pipeline(
                     "words": fillers,
                     "total_count": self.state.filler_count,
                 })
+                self.state.maybe_queue_filler_coaching(fillers)
+
+            if self.state.pending_coaching_notes:
+                note = self.state.pending_coaching_notes.pop(0)
+                await _speak_to_student(note)
 
             milestone = self.state.mid_inject_milestone()
             if milestone and substantive:
@@ -559,7 +566,10 @@ async def run_interview_pipeline(
 
     user_row = fetch_one(
         supabase_admin.table("users")
-        .select("target_role, email")
+        .select(
+            "target_role, email, full_name, college, branch, graduation_year, "
+            "interview_timeline, resume_text"
+        )
         .eq("id", user_id)
     )
     target_role = (user_row or {}).get("target_role")
@@ -598,7 +608,8 @@ async def run_interview_pipeline(
 
     logger.info(
         f"Session start | prior_completed={completed_count} → difficulty={difficulty} | "
-        f"past_topics={len(past_topics)} | round={round_type} | role={target_role or 'general'}"
+        f"past_topics={len(past_topics)} | round={round_type} | role={target_role or 'general'} | "
+        f"student={(user_row or {}).get('full_name') or user_id[:8]}"
     )
 
     state = create_session_state(
@@ -606,12 +617,17 @@ async def run_interview_pipeline(
         user_id=user_id,
         company=company,
         round_type=round_type,
-        resume_text=resume_text,
+        resume_text=resume_text or (user_row or {}).get("resume_text") or "",
         past_topics=past_topics,
         interviewer=persona,
         personas_by_phase=personas_by_phase,
         difficulty_level=difficulty,
         target_role=target_role,
+        interview_timeline=(user_row or {}).get("interview_timeline"),
+        full_name=(user_row or {}).get("full_name") or "",
+        college=(user_row or {}).get("college") or "",
+        graduation_year=(user_row or {}).get("graduation_year"),
+        branch=(user_row or {}).get("branch") or "",
     )
 
     try:
@@ -669,7 +685,14 @@ async def run_interview_pipeline(
     # Context holds the conversation history. We seed it with one user message
     # so Gemini speaks the greeting first (inference_on_context_initialization).
     context = LLMContext(messages=[
-        {"role": "user", "content": "Please introduce yourself and start the interview now."}
+        {
+            "role": "user",
+            "content": (
+                "The student has joined the video room. Greet them warmly, "
+                "introduce yourself as the interviewer, explain what this round covers, "
+                "and ask them to introduce themselves to begin the interview."
+            ),
+        }
     ])
     context_aggregator = LLMContextAggregatorPair(
         context,

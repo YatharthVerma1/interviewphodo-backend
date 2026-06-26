@@ -94,18 +94,22 @@ async def update_profile(
             .update(payload) \
             .eq("id", current_user["id"]) \
             .execute()
-        return result.data[0]
+        updated = result.data[0]
+        synced = get_user_with_synced_subscription(updated, jwt_email=current_user.get("email"))
+        return owner_profile_view(synced, jwt_email=current_user.get("email"))
     except Exception:
         # Graceful fallback if migration 003 not applied yet
         payload.pop("target_role", None)
         payload.pop("interview_timeline", None)
         if not payload:
-            return current_user
+            return owner_profile_view(current_user, jwt_email=current_user.get("email"))
         result = supabase_admin.table("users") \
             .update(payload) \
             .eq("id", current_user["id"]) \
             .execute()
-        return result.data[0]
+        updated = result.data[0]
+        synced = get_user_with_synced_subscription(updated, jwt_email=current_user.get("email"))
+        return owner_profile_view(synced, jwt_email=current_user.get("email"))
 
 
 @router.post("/upload-resume")

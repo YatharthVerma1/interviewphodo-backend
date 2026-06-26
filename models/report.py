@@ -1,5 +1,5 @@
+from typing import Optional, Any
 from pydantic import BaseModel
-from typing import Optional
 from datetime import datetime
 
 
@@ -26,4 +26,8 @@ class ReportResponse(BaseModel):
     eye_contact_score: Optional[int] = None
     ai_closing_summary: Optional[str] = None
     turn_breakdown: Optional[list] = None
+    star_analysis: Optional[dict[str, Any]] = None
+    delivery_score: Optional[int] = None
+    delivery_breakdown: Optional[dict[str, Any]] = None
+    question_heatmap: Optional[list] = None
     created_at: Optional[datetime] = None

@@ -135,6 +135,7 @@ class InterviewState:
     transcript:    list = field(default_factory=list)
     phase_scores:  dict = field(default_factory=dict)
     posture_events: list = field(default_factory=list)
+    eye_contact_samples: list = field(default_factory=list)
     phase_order:   list = field(default_factory=list)
     phase_budgets: dict = field(default_factory=dict)
     # Topics already asked to this user across past sessions (cross-session
@@ -142,6 +143,11 @@ class InterviewState:
     # "do not repeat any of these questions".
     past_topics:   list = field(default_factory=list)
     target_role:   Optional[str] = None
+    interview_timeline: Optional[str] = None
+    full_name:     str = ""
+    college:       str = ""
+    graduation_year: Optional[int] = None
+    branch:        str = ""
     # Persona for the CURRENT speaker. In normal rounds this is set once at
     # session start. In `multi_persona` rounds it gets swapped on phase change.
     interviewer:   dict = field(default_factory=dict)
@@ -156,6 +162,12 @@ class InterviewState:
     dynamic_injection_count: int = 0
     # Tracks mid-phase Gemini injections at 50% / 75% of each phase budget.
     mid_injection_marks: set = field(default_factory=set)
+    # Live coaching — non-coaching rounds warn only after repeated issues.
+    posture_slouch_events: int = 0
+    posture_lookaway_events: int = 0
+    filler_verbal_warnings: int = 0
+    posture_verbal_warnings: int = 0
+    pending_coaching_notes: list = field(default_factory=list)
     started_at:    float = field(default_factory=time.time)
     # Set when the student actually joins the Daily room (interview clock starts).
     joined_at:     Optional[float] = None
@@ -373,6 +385,69 @@ class InterviewState:
             "turn": self.total_turns,
             "timestamp": time.time(),
         })
+        if event_type == "slouching":
+            self.posture_slouch_events += 1
+            self._maybe_queue_posture_coaching("slouching")
+        elif event_type == "looking_away":
+            self.posture_lookaway_events += 1
+            self._maybe_queue_posture_coaching("looking_away")
+
+    def add_eye_contact_sample(self, score: int) -> None:
+        """Store a 0–100 eye-contact reading for session-average report scoring."""
+        clamped = max(0, min(100, int(score)))
+        self.eye_contact_samples.append(clamped)
+        self.posture_events.append({
+            "type": "eye_contact_sample",
+            "score": clamped,
+            "phase": self.current_phase.value,
+            "timestamp": time.time(),
+        })
+
+    def _maybe_queue_posture_coaching(self, event_type: str) -> None:
+        """Non-coaching: warn by voice only after 2+ posture issues, max 2 warnings."""
+        if self.round_type == "coaching":
+            return
+        if self.posture_verbal_warnings >= 2:
+            return
+        threshold = 2
+        count = self.posture_slouch_events if event_type == "slouching" else self.posture_lookaway_events
+        if count < threshold:
+            return
+        # Fire once per threshold crossing (2nd, 4th event, etc.) up to max warnings.
+        if count != threshold and count != threshold + 2:
+            return
+        self.posture_verbal_warnings += 1
+        if event_type == "slouching":
+            note = (
+                "[INTERNAL COACHING NOTE — POSTURE] The candidate has slouched repeatedly. "
+                "Give ONE brief professional reminder to sit upright with shoulders back. "
+                "Do not lecture. Then continue the interview with your next question."
+            )
+        else:
+            note = (
+                "[INTERNAL COACHING NOTE — EYE CONTACT] The candidate has looked away from "
+                "the camera repeatedly. Give ONE brief reminder to maintain eye contact. "
+                "Then continue the interview normally."
+            )
+        self.pending_coaching_notes.append(note)
+
+    def maybe_queue_filler_coaching(self, fillers: list) -> None:
+        """Non-coaching: verbal filler note only when 3+ fillers in one answer, max 2 times."""
+        if self.round_type == "coaching" or not fillers:
+            return
+        if self.filler_verbal_warnings >= 2:
+            return
+        if len(fillers) < 3:
+            return
+        self.filler_verbal_warnings += 1
+        words = ", ".join(f"'{w}'" for w in fillers[:4])
+        self.pending_coaching_notes.append(
+            "[INTERNAL COACHING NOTE — FILLERS] In their last answer the candidate used "
+            f"several filler words ({words}). Give ONE brief reminder to pause silently "
+            "instead of using fillers — keep it professional like a real interviewer, "
+            "then ask your next question. Do not repeat this coaching again unless "
+            "you receive another internal note."
+        )
 
     def get_duration_seconds(self) -> int:
         return int(time.time() - self.started_at)
@@ -466,6 +541,11 @@ def create_session_state(
     personas_by_phase: Optional[dict] = None,
     difficulty_level: str = "medium",
     target_role: Optional[str] = None,
+    interview_timeline: Optional[str] = None,
+    full_name: str = "",
+    college: str = "",
+    graduation_year: Optional[int] = None,
+    branch: str = "",
 ) -> InterviewState:
     state = InterviewState(
         session_id=session_id,
@@ -478,6 +558,11 @@ def create_session_state(
         personas_by_phase=personas_by_phase or {},
         difficulty_level=difficulty_level,
         target_role=target_role,
+        interview_timeline=interview_timeline,
+        full_name=full_name or "",
+        college=college or "",
+        graduation_year=graduation_year,
+        branch=branch or "",
     )
     active_sessions[session_id] = state
     return state

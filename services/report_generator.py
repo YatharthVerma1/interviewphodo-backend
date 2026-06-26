@@ -43,6 +43,11 @@ def state_from_session_row(session: dict) -> InterviewState:
     state.filler_count = session.get("filler_count") or 0
     state.total_turns = session.get("total_turns") or len(state.transcript)
     state.posture_events = session.get("posture_events") or []
+    state.eye_contact_samples = [
+        int(e["score"])
+        for e in state.posture_events
+        if e.get("type") == "eye_contact_sample" and e.get("score") is not None
+    ]
     state.phase_scores = _phase_scores_from_transcript(state.transcript)
     dur = session.get("duration_seconds")
     if dur and int(dur) > 0:
@@ -93,7 +98,10 @@ async def generate_report(state: InterviewState):
     closing_summary = _extract_closing_summary(state.transcript)
 
     posture_score     = _posture_score(state.posture_events)
-    eye_contact_score = _eye_contact_score(state.posture_events)
+    eye_contact_score = _eye_contact_score(
+        state.posture_events,
+        state.eye_contact_samples,
+    )
 
     report = {
         "session_id":         state.session_id,
@@ -169,17 +177,31 @@ def _extract_closing_summary(transcript: list) -> str:
 
 
 def _posture_score(events: list) -> int:
-    if not events:
+    posture_events = [e for e in events if e.get("type") != "eye_contact_sample"]
+    if not posture_events:
         return 85
-    bad = sum(1 for e in events if e.get("type") == "slouching")
-    return max(0, int(100 - (bad / len(events)) * 100))
+    bad = sum(1 for e in posture_events if e.get("type") == "slouching")
+    return max(0, int(100 - (bad / len(posture_events)) * 100))
 
 
-def _eye_contact_score(events: list) -> int:
+def _eye_contact_score(events: list, samples: list | None = None) -> int:
+    """Average of all eye-contact readings during the session (primary)."""
+    numeric_samples: list[int] = []
+    if samples:
+        numeric_samples.extend(int(s) for s in samples if s is not None)
+    for e in events:
+        if e.get("type") == "eye_contact_sample" and e.get("score") is not None:
+            numeric_samples.append(int(e["score"]))
+    if numeric_samples:
+        return max(0, min(100, int(round(sum(numeric_samples) / len(numeric_samples)))))
+
     if not events:
         return 80
     away = sum(1 for e in events if e.get("type") == "looking_away")
-    return max(0, int(100 - (away / len(events)) * 100))
+    non_sample = [e for e in events if e.get("type") != "eye_contact_sample"]
+    if not non_sample:
+        return 80
+    return max(0, int(100 - (away / len(non_sample)) * 100))
 
 
 async def backfill_missing_reports(user_id: str, limit: int = 25) -> int:

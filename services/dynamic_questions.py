@@ -216,6 +216,11 @@ Round type: {state.round_type} — {round_ctx}
 Current interview phase: {phase.value}
 Target role: {state.target_role or 'general software engineer'}
 
+Student profile:
+- Name: {state.full_name or 'Unknown'}
+- College: {state.college or 'Unknown'}, graduating {state.graduation_year or 'Unknown'}
+- Interview timeline: {state.interview_timeline or 'not specified'}
+
 Student resume excerpt:
 {resume}
 

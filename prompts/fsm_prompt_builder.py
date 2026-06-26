@@ -5,7 +5,7 @@ Rebuilds the Gemini system prompt on every phase transition.
 
 from services.interview_fsm import InterviewPhase, InterviewState
 from prompts.companies import get_company_config
-from prompts.role_pools import build_role_prompt_block
+from prompts.role_pools import build_role_prompt_block, build_timeline_prompt_block, get_role_pool
 
 FILLER_WORDS = [
     "um", "uh", "like", "basically", "actually", "you know",
@@ -20,11 +20,24 @@ GOALS:
 1. Greet the student warmly. Introduce yourself by name and role at {company_name}.
 2. Say in your own words what THIS round will cover (round-specific):
    {round_brief}
-3. Ask exactly ONE warm-up question: "Please tell me about yourself — your BTech
-   stream, your college, and what you have been working on recently."
-4. After their answer: one sentence of acknowledgment only.
+3. Ask exactly ONE warm-up question — this MUST be a self-introduction request.
+   This is the first and most important question of every interview. It helps the
+   student get comfortable speaking before harder questions.
+   Example framing (adapt naturally, do not read verbatim):
+   "Before we dive in, please introduce yourself — tell me about your background,
+   what you've been working on recently, and what interests you about {target_role_label}."
+   {student_profile_summary}
+   - If you know their first name from their profile, greet them by name first.
+   - You ALREADY HAVE their profile on file (name, college, year, resume, role).
+     Remember and use that data throughout the interview — but STILL ask them to
+     introduce themselves now so they can warm up in their own words.
+   - Listen to HOW they present themselves, their projects, and their motivation.
+   - Do NOT skip the introduction. Do NOT jump straight to technical/resume/HR questions.
+   - Do NOT ask them to repeat name/college/graduation year as separate checklist items
+     you already know — let their introduction flow naturally.
+4. After their introduction: one sentence of acknowledgment only.
 5. Then transition naturally into the next phase.
-DO NOT: ask technical, behavioral, or HR questions. Ask more than 1 question.
+DO NOT: ask technical, behavioral, or HR questions in this phase. Ask more than 1 question.
 """,
 
     InterviewPhase.RESUME: """
@@ -219,7 +232,8 @@ DIFFICULTY MODE: MEDIUM (standard interview pressure)
     "hard": """
 DIFFICULTY MODE: HARD (student has practised with this company multiple times)
 - Push the candidate. They have done this before — raise the bar.
-- Skip warm-up softballs. Go straight to medium-hard difficulty.
+- INTRO phase is still required: ask them to introduce themselves first (never skip).
+- After intro, skip other softballs — go straight to medium-hard difficulty.
 - Probe shallow answers aggressively: "Go deeper. What about the edge case where..."
 - Less hand-holding. Less coaching. Treat them like a real serious candidate.
 - Include 1 trick / out-of-syllabus question to test composure under stress.
@@ -302,12 +316,77 @@ hear the same questions twice. Pick FRESH angles, FRESH topics, FRESH framings.
 """
 
 
+def _student_profile_summary(state: InterviewState) -> str:
+    """One-line summary for intro phase when profile is known."""
+    parts: list[str] = []
+    if state.full_name:
+        parts.append(state.full_name.split()[0])
+    if state.college:
+        parts.append(state.college)
+    if state.graduation_year:
+        parts.append(f"Class of {state.graduation_year}")
+    if state.branch:
+        parts.append(state.branch)
+    pool = get_role_pool(state.target_role)
+    role_label = pool["label"] if pool else (state.target_role or "software engineering")
+    if parts:
+        return (
+            f"Profile on file: {', '.join(parts)}. Target role: {role_label}. "
+            "You know this data — use it to personalise the whole interview. "
+            "STILL ask them to introduce themselves verbally in this phase so they "
+            "can warm up; listen to how they present themselves, not just the facts."
+        )
+    return (
+        "Limited profile on file. Ask them to introduce themselves — college, stream, "
+        "recent projects, and why they are preparing for interviews."
+    )
+
+
+def build_student_profile_block(state: InterviewState) -> str:
+    """Candidate profile injected into every Gemini system prompt."""
+    pool = get_role_pool(state.target_role)
+    role_label = pool["label"] if pool else (state.target_role or "General software engineering")
+
+    timeline_labels = {
+        "this_week": "Interview this week",
+        "two_to_four_weeks": "Interview in 2–4 weeks",
+        "one_to_three_months": "Interview in 1–3 months",
+        "exploring": "Just exploring / early prep",
+    }
+    timeline_label = timeline_labels.get(state.interview_timeline or "", state.interview_timeline or "Not specified")
+
+    resume_note = (
+        "Resume on file — use it in RESUME and TECHNICAL phases."
+        if (state.resume_text or "").strip()
+        else "No resume uploaded — ask about final-year project and skills instead."
+    )
+
+    lines = [
+        "=== CANDIDATE PROFILE (personalise every question to THIS student) ===",
+        f"Name: {state.full_name or 'Not provided'}",
+        f"College: {state.college or 'Not provided'}",
+        f"Graduation year: {state.graduation_year or 'Not provided'}",
+        f"Branch / stream: {state.branch or 'Not provided'}",
+        f"Target role: {role_label}",
+        f"Interview timeline: {timeline_label}",
+        resume_note,
+        "RULE: INTRO phase — always ask the student to introduce themselves (warm-up).",
+        "RULE: You already know their profile — use it to personalise later questions.",
+        "RULE: Do not re-ask name/college/year as a separate checklist after intro.",
+        "RULE: Tailor technical and behavioural questions to their target role.",
+        "=====================================================================",
+    ]
+    return "\n".join(lines)
+
+
 def build_system_prompt(state: InterviewState) -> str:
     """Build the complete Gemini system prompt for the current FSM phase."""
     config = get_company_config(state.company)
 
     past_topics_block = _format_past_topics(state.past_topics)
     role_block = build_role_prompt_block(state.target_role)
+    timeline_block = build_timeline_prompt_block(state.interview_timeline)
+    profile_block = build_student_profile_block(state)
 
     # Persona for the CURRENT phase.
     # multi_persona rounds it changes per phase. `state.persona_for_phase()`
@@ -325,6 +404,23 @@ def build_system_prompt(state: InterviewState) -> str:
     coaching_block = ""
     if state.round_type == "coaching":
         coaching_block = COACHING_OVERRIDE.format(company_name=config['company_name'])
+
+    if state.round_type == "coaching":
+        filler_posture_rules = f"""
+5. FILLER WORDS: Track these in student speech: {', '.join(FILLER_WORDS)}
+   If student uses 3+ fillers in one answer, you may coach once: "I noticed filler words —
+   in interviews, practice pausing silently instead."
+6. POSTURE: If you receive an [INTERNAL COACHING NOTE] about posture or eye contact,
+   give ONE brief reminder, then continue. You may also coach posture when clearly needed
+   in this coaching session."""
+    else:
+        filler_posture_rules = """
+5. FILLER WORDS — REAL INTERVIEW MODE: Do NOT mention filler words ("um", "like", "basically")
+   in your spoken responses unless you receive an [INTERNAL COACHING NOTE — FILLERS].
+   Real interviewers ignore occasional fillers and stay focused on the question.
+6. POSTURE / EYE CONTACT — REAL INTERVIEW MODE: Do NOT say "sit up straight", "look at the
+   camera", or comment on body language unless you receive an [INTERNAL COACHING NOTE].
+   Never nag about posture unprompted."""
 
     round_brief = ROUND_BRIEFS.get(state.round_type, ROUND_BRIEFS["full"])
     persona_lean = (state.interviewer or {}).get("lean", "")
@@ -350,6 +446,8 @@ COMPANY INTERVIEW STYLE FOR THIS ROUND: {_style_for_round(config, state.round_ty
 {difficulty_block}
 {coaching_block}
 {past_topics_block}
+{profile_block}
+{timeline_block}
 {role_block}
 ABSOLUTE RULES — APPLY IN EVERY PHASE:
 1. You are a professional interviewer. NOT a chatbot, tutor, or general assistant.
@@ -367,12 +465,7 @@ ABSOLUTE RULES — APPLY IN EVERY PHASE:
    sentences of specific feedback before your next question.
    Example: "[SCORE:7] Good structure on the project explanation, but quantify
    your impact with numbers. Now let me ask you about..."
-5. FILLER WORDS: Track these in student speech: {', '.join(FILLER_WORDS)}
-   If student uses 3+ fillers in one answer, say once: "I noticed you said 'um' or
-   'basically' several times. In interviews, practice pausing silently instead."
-6. POSTURE: If you see "[POSTURE: slouching]" or "[POSTURE: looking away]" in the
-   conversation, say once: "Please sit up straight and look at the camera.
-   Body language matters in a real interview."
+{filler_posture_rules}
 7. GRAMMAR: If student uses incorrect grammar, correct it gently and move on.
 8. OFF-TOPIC: If student goes off-topic, redirect: "Let us stay focused.
    [repeat or continue with the current question]"
@@ -442,6 +535,8 @@ LIVE SESSION PROGRESS (backend-enforced — follow exactly):
         n_behavioral = state.get_phase_budget(InterviewPhase.BEHAVIORAL),
         n_hr         = state.get_phase_budget(InterviewPhase.HR_ROUND),
         n_qa         = state.get_phase_budget(InterviewPhase.CANDIDATE_QA),
+        student_profile_summary=_student_profile_summary(state),
+        target_role_label=(get_role_pool(state.target_role) or {}).get("label", "their target role"),
     )
 
     return base + progress_block + "\n\n" + phase_instruction

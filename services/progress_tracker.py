@@ -8,6 +8,8 @@ Used by GET /api/reports/my-progress for frontend charts.
 from __future__ import annotations
 
 from collections import defaultdict
+
+from services.interview_analysis import build_progress_insights
 from typing import Optional
 
 from database.supabase_client import supabase_admin
@@ -23,6 +25,11 @@ _PHASE_TO_SKILL = {
     "hr_round":      "hr_strategy",
     "intro":         "communication",
 }
+
+
+def _sort_timeline_by_date(items: list[dict]) -> list[dict]:
+    """Oldest first, newest last — matches left-to-right chart axis."""
+    return sorted(items, key=lambda x: x.get("date") or "")
 
 
 def build_user_progress(user_id: str, company: Optional[str] = None) -> dict:
@@ -218,14 +225,14 @@ def build_user_progress(user_id: str, company: Optional[str] = None) -> dict:
     else:
         filler_improving = None
 
-    return {
+    result = {
         "filter_company":     company,
         "total_completed":    len(sessions),
         "total_with_reports": len(reports),
         "by_company":         company_summary,
-        "score_timeline":     list(reversed(score_timeline)),
-        "filler_timeline":    list(reversed(filler_timeline)),
-        "wpm_timeline":       list(reversed(wpm_timeline)),
+        "score_timeline":     _sort_timeline_by_date(score_timeline),
+        "filler_timeline":    _sort_timeline_by_date(filler_timeline),
+        "wpm_timeline":       _sort_timeline_by_date(wpm_timeline),
         "by_phase_avg":       by_phase_avg,
         "by_skill":           by_skill,
         "insights": {
@@ -235,6 +242,8 @@ def build_user_progress(user_id: str, company: Optional[str] = None) -> dict:
             "weakest_skill":     min(by_skill, key=by_skill.get) if by_skill else None,
         },
     }
+    result["performance_insights"] = build_progress_insights(result)
+    return result
 
 
 def _speech_metrics(report: dict, session: dict) -> tuple[int, float]:
@@ -269,4 +278,5 @@ def _empty_progress(company: Optional[str]) -> dict:
             "strongest_skill":       None,
             "weakest_skill":         None,
         },
+        "performance_insights": {"going_well": [], "work_on": []},
     }

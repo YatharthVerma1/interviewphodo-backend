@@ -7,6 +7,11 @@ from services.speech_analyser import (
     count_fillers_in_transcript,
     detect_fillers_combined,
 )
+from services.interview_analysis import (
+    analyse_session_star,
+    delivery_score,
+    turn_heatmap,
+)
 from services.turn_scorer import build_turn_breakdown, score_turn
 
 
@@ -48,6 +53,21 @@ def enrich_report_from_session(report: dict, session: dict | None) -> dict:
         enriched["overall_score"] = round(
             sum(t["score"] for t in breakdown) / len(breakdown) * 10
         )
+
+    star = analyse_session_star(transcript)
+    if star:
+        enriched["star_analysis"] = star
+
+    delivery = delivery_score(
+        enriched.get("posture_score"),
+        enriched.get("eye_contact_score"),
+        enriched.get("words_per_minute"),
+        enriched.get("filler_percentage"),
+    )
+    enriched["delivery_score"] = delivery["overall"]
+    enriched["delivery_breakdown"] = delivery
+
+    enriched["question_heatmap"] = turn_heatmap(transcript, breakdown)
 
     return enriched
 

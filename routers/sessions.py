@@ -83,6 +83,7 @@ async def start_session(
         supabase_admin.table("users")
         .select(
             "id, plan, sessions_used, sessions_limit, resume_text, target_role, "
+            "full_name, college, graduation_year, interview_timeline, "
             "subscription_starts_at, subscription_ends_at"
         )
         .eq("id", current_user["id"])
